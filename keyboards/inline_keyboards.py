@@ -201,38 +201,6 @@ def downloads_admin_keyboard(can_cleanup: bool = True, refresh_callback: str = "
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def return_search_keyboard():
-    buttons = [
-        [
-            InlineKeyboardButton(text="ID", callback_data="search_id"),
-            InlineKeyboardButton(text="Username", callback_data="search_username"),
-        ],
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_admin")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def return_control_user_keyboard(user_id, status):
-    builder = InlineKeyboardBuilder()
-
-    go_to_chat = InlineKeyboardButton(text="Open Chat", url=f"tg://user?id={user_id}")
-    write_user = InlineKeyboardButton(text="Write as Bot", callback_data=f"write_{user_id}")
-    ban_button = InlineKeyboardButton(text="Ban", callback_data=f"ban_{user_id}")
-    unban_button = InlineKeyboardButton(text="Unban", callback_data=f"unban_{user_id}")
-    back_button = InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_admin")
-
-    builder.row(go_to_chat, write_user)
-
-    if status == "active":
-        builder.row(ban_button)
-    elif status == "ban":
-        builder.row(unban_button)
-
-    builder.row(back_button)
-
-    return builder.as_markup()
-
-
 def return_back_to_admin_keyboard():
     back_button = [
         [InlineKeyboardButton(text="⬅️ Back", callback_data="back_to_admin")]

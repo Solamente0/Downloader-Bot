@@ -13,6 +13,7 @@ _bot_avatar_path: Optional[str] = None
 _bot_username: Optional[str] = None
 _bot_id: Optional[int] = None
 _bot_identity_lock = asyncio.Lock()
+_bot_avatar_lock = asyncio.Lock()
 _AUDIO_THUMB_MAX_DIMENSION = 320
 _AUDIO_THUMB_MAX_BYTES = 200 * 1024
 _AUDIO_THUMB_PATH = Path("downloads") / "bot_audio_thumbnail.jpg"
@@ -71,26 +72,32 @@ async def get_bot_avatar_thumbnail(bot: Bot) -> Optional[FSInputFile]:
     global _bot_avatar_path
     if _bot_avatar_path and _is_usable_thumbnail_file(Path(_bot_avatar_path)):
         return FSInputFile(_bot_avatar_path)
-    if _bot_avatar_path:
-        Path(_bot_avatar_path).unlink(missing_ok=True)
-        _bot_avatar_path = None
 
-    try:
-        bot_id = await _get_bot_id(bot)
-        photos = await bot.get_user_profile_photos(bot_id, limit=1)
-        if not photos.total_count or not photos.photos:
-            return None
+    # Serialize download/normalize so concurrent cold-cache callers do not
+    # clobber each other's fixed temp files.
+    async with _bot_avatar_lock:
+        if _bot_avatar_path:
+            if _is_usable_thumbnail_file(Path(_bot_avatar_path)):
+                return FSInputFile(_bot_avatar_path)
+            Path(_bot_avatar_path).unlink(missing_ok=True)
+            _bot_avatar_path = None
 
-        avatar_path = _AUDIO_THUMB_PATH
-        avatar_path.parent.mkdir(parents=True, exist_ok=True)
-        file_id = _select_audio_thumbnail_file_id(photos.photos[0])
-        if not await _download_bot_avatar_file(bot, file_id, avatar_path):
+        try:
+            bot_id = await _get_bot_id(bot)
+            photos = await bot.get_user_profile_photos(bot_id, limit=1)
+            if not photos.total_count or not photos.photos:
+                return None
+
+            avatar_path = _AUDIO_THUMB_PATH
+            avatar_path.parent.mkdir(parents=True, exist_ok=True)
+            file_id = _select_audio_thumbnail_file_id(photos.photos[0])
+            if not await _download_bot_avatar_file(bot, file_id, avatar_path):
+                return None
+            _bot_avatar_path = str(avatar_path)
+            return FSInputFile(_bot_avatar_path)
+        except Exception as exc:
+            logging.debug("Failed to fetch bot avatar thumbnail: error=%s", exc)
             return None
-        _bot_avatar_path = str(avatar_path)
-        return FSInputFile(_bot_avatar_path)
-    except Exception as exc:
-        logging.debug("Failed to fetch bot avatar thumbnail: error=%s", exc)
-        return None
 
 
 async def _download_bot_avatar_file(bot: Bot, file_id: str, final_path: Path) -> bool:
@@ -110,7 +117,7 @@ async def _download_bot_avatar_file(bot: Bot, file_id: str, final_path: Path) ->
             final_path.unlink(missing_ok=True)
             return False
 
-        if _normalize_audio_thumbnail_file(temp_path, normalized_path):
+        if await asyncio.to_thread(_normalize_audio_thumbnail_file, temp_path, normalized_path):
             final_path.unlink(missing_ok=True)
             normalized_path.replace(final_path)
         else:

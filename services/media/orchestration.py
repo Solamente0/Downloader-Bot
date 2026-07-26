@@ -1,6 +1,7 @@
 import asyncio
-from typing import Any, Awaitable, Callable, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Optional, Sequence, TypeVar
 
+from services.media.resolver import resolve_cached_media_items
 from utils.download_manager import (
     DownloadMetrics,
     DownloadQueueBusyError,
@@ -76,6 +77,26 @@ async def handle_download_backpressure(
         await on_queue_busy_reply(exc.position)
         return
     raise exc
+
+
+def make_message_backpressure_handler(
+    message: Any,
+    business_id: Optional[int],
+    *,
+    build_rate_limit_text: Callable[[Any], str],
+    build_queue_busy_text: Callable[[int], str],
+    handle_download_error: Callable[..., Awaitable[Any]],
+) -> Callable[[Exception], Awaitable[None]]:
+    async def _handle_backpressure(exc: Exception) -> None:
+        await handle_download_backpressure(
+            exc,
+            business_id=business_id,
+            on_rate_limit_reply=lambda retry_after: message.reply(build_rate_limit_text(retry_after)),
+            on_queue_busy_reply=lambda position: message.reply(build_queue_busy_text(position)),
+            on_business_error=lambda: handle_download_error(message, business_id=business_id),
+        )
+
+    return _handle_backpressure
 
 
 async def run_single_media_flow(
@@ -236,3 +257,45 @@ async def run_media_collection_flow(
         await delete_status_message()
         if cleanup:
             await cleanup()
+
+
+async def run_media_group_flow(
+    *,
+    media_list: Sequence[Any],
+    db_service: Any,
+    kind_getter: Callable[[Any], str],
+    build_cache_key: Callable[[int, Any, str], str],
+    download_item: Callable[[int, Any, str], Awaitable[Any]],
+    metrics_label: str,
+    error_label: str,
+    update_status: Callable[[str], Awaitable[None]],
+    upload_status_text: str,
+    send_entries: Callable[[list[dict[str, Any]]], Awaitable[None]],
+    on_empty: Callable[[], Awaitable[None]],
+    delete_status_message: Callable[[], Awaitable[None]],
+    cleanup_path: Callable[[str], Awaitable[None]],
+    on_after_send: Optional[Callable[[], Awaitable[None]]] = None,
+) -> bool:
+    media_items, downloaded_paths = await resolve_cached_media_items(
+        media_list,
+        db_service=db_service,
+        kind_getter=kind_getter,
+        build_cache_key=build_cache_key,
+        download_item=download_item,
+        metrics_label=metrics_label,
+        error_label=error_label,
+    )
+    if not media_items:
+        await on_empty()
+        return False
+
+    try:
+        await update_status(upload_status_text)
+        await send_entries(media_items)
+        if on_after_send:
+            await on_after_send()
+        return True
+    finally:
+        await delete_status_message()
+        for path in downloaded_paths:
+            await cleanup_path(path)

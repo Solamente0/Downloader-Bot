@@ -7,9 +7,12 @@ logging = logging.bind(service="tiktok_media")
 
 
 class TikTokProfileMixin:
+    USER_LOOKUP_MAX_RETRIES = 10
+    USER_LOOKUP_RETRY_DELAY_SECONDS = 1.5
+
     async def fetch_user_info(self, username: str) -> TikTokUser | None:
-        max_retries = 10
-        retry_delay = 1.5
+        max_retries = self.USER_LOOKUP_MAX_RETRIES
+        retry_delay = self.USER_LOOKUP_RETRY_DELAY_SECONDS
         exist_data: dict | None = None
         session = await self._get_http_session()
         headers = {"User-Agent": self._get_user_agent()}
@@ -25,6 +28,11 @@ class TikTokProfileMixin:
                     sec_user_id = exist_data.get("sec_uid") if isinstance(exist_data, dict) else None
                     if sec_user_id:
                         break
+                    logging.warning(
+                        "TikTok user lookup missing sec_uid: attempt=%s username=%s",
+                        attempt + 1,
+                        username,
+                    )
                 except Exception as exc:
                     logging.warning(
                         "TikTok user lookup retry failed: attempt=%s username=%s error=%s",
@@ -32,7 +40,9 @@ class TikTokProfileMixin:
                         username,
                         exc,
                     )
-                    await asyncio.sleep(retry_delay)
+                # Sleep on every failed iteration (missing sec_uid included),
+                # not only when the request itself raised.
+                await asyncio.sleep(retry_delay)
             else:
                 logging.error("Failed to get TikTok user data after %s attempts: username=%s", max_retries, username)
                 return None

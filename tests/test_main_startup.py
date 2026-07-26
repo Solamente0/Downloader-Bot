@@ -56,3 +56,43 @@ async def test_main_applies_polling_backpressure_settings(monkeypatch):
         allowed_updates=["message", "callback_query"],
         tasks_concurrency_limit=123,
     )
+
+
+@pytest.mark.asyncio
+async def test_main_registers_one_shared_middleware_instance_per_class(monkeypatch):
+    import middlewares
+
+    monkeypatch.setattr(main_module.bot, "get_me", AsyncMock(return_value=SimpleNamespace(username="TestBot")))
+    monkeypatch.setattr(main_module.bot, "set_my_commands", AsyncMock())
+    monkeypatch.setattr(main_module.bot, "delete_webhook", AsyncMock())
+    monkeypatch.setattr(main_module.db, "init_db", AsyncMock())
+    monkeypatch.setattr(main_module, "start_analytics_workers", AsyncMock())
+    monkeypatch.setattr(main_module, "stop_analytics_workers", AsyncMock())
+    monkeypatch.setattr(main_module, "shutdown_download_queue", AsyncMock())
+    monkeypatch.setattr(main_module, "close_http_session", AsyncMock())
+    monkeypatch.setattr(main_module.session, "close", AsyncMock())
+    monkeypatch.setattr(main_module, "set_app_context", lambda **_kwargs: None)
+    monkeypatch.setattr(main_module, "crontab", Mock())
+    monkeypatch.setattr(main_module.dp, "include_router", Mock())
+    monkeypatch.setattr(main_module.dp.message, "outer_middleware", Mock())
+    monkeypatch.setattr(main_module.dp.callback_query, "outer_middleware", Mock())
+    monkeypatch.setattr(main_module.dp.inline_query, "outer_middleware", Mock())
+    monkeypatch.setattr(main_module.dp, "resolve_used_update_types", Mock(return_value=["message"]))
+    monkeypatch.setattr(main_module.dp, "start_polling", AsyncMock(side_effect=RuntimeError("stop-polling")))
+
+    with pytest.raises(RuntimeError, match="stop-polling"):
+        await main_module.main()
+
+    message_instances = [call.args[0] for call in main_module.dp.message.outer_middleware.call_args_list]
+    callback_instances = [call.args[0] for call in main_module.dp.callback_query.outer_middleware.call_args_list]
+    inline_instances = [call.args[0] for call in main_module.dp.inline_query.outer_middleware.call_args_list]
+
+    assert len(message_instances) == len(middlewares.__all__)
+    assert len(callback_instances) == len(middlewares.__all__)
+    assert len(inline_instances) == len(middlewares.__all__)
+    for middleware_cls, message_mw, callback_mw, inline_mw in zip(
+        middlewares.__all__, message_instances, callback_instances, inline_instances
+    ):
+        assert isinstance(message_mw, middleware_cls)
+        assert message_mw is callback_mw
+        assert message_mw is inline_mw

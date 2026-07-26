@@ -20,10 +20,10 @@ from handlers.request_dedupe import claim_message_request
 from handlers.tiktok_inline import handle_tiktok_inline_query, send_inline_tiktok_media
 from services.media.delivery import (
     build_audio_cache_key,
+    make_video_or_document_senders,
     send_audio_with_thumbnail,
     send_cached_media_entries,
 )
-from services.media.video_metadata import build_video_send_kwargs
 from services.media.orchestration import run_single_media_flow
 from handlers.user import update_info
 from handlers.utils import (
@@ -35,6 +35,7 @@ from handlers.utils import (
     handle_video_too_large,
     should_skip_duplicate_business_message,
     load_user_settings,
+    make_backpressure_handler,
     make_retry_status_notifier,
     make_status_text_progress_updater,
     maybe_delete_user_message,
@@ -47,8 +48,7 @@ from handlers.utils import (
     safe_answer_inline_query,
     send_chat_action_if_needed,
     retry_async_operation,
-    with_callback_logging,
-    with_chosen_inline_logging,
+    register_inline_send_handlers,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
@@ -164,7 +164,7 @@ async def process_tiktok(message: types.Message, direct_url: Optional[str] = Non
 
         # Profile lookup: allow messages like "@username" without a URL.
         if direct_url is None and re.fullmatch(r"@[\w.]{1,32}", stripped):
-            await react_to_message(message, "рџ‘ѕ", business_id=business_id)
+            await react_to_message(message, "👾", business_id=business_id)
             settings = await load_user_settings(db, message)
             await process_tiktok_profile(
                 message, stripped, bot_url, settings["captions"]
@@ -246,9 +246,11 @@ async def process_tiktok_video(
     bot_url: str,
     user_settings: dict,
     business_id: Optional[int],
+    actor_user_id: Optional[int] = None,
 ):
+    actor_id = actor_user_id or message.from_user.id
     await send_analytics(
-        user_id=message.from_user.id,
+        user_id=actor_id,
         chat_type=message.chat.type,
         action_name="tiktok_video",
     )
@@ -256,7 +258,7 @@ async def process_tiktok_video(
     if not info:
         logging.warning(
             "TikTok video metadata missing: user_id=%s data_keys=%s",
-            message.from_user.id,
+            actor_id,
             list(data.keys()),
         )
         await handle_download_error(message, business_id=business_id)
@@ -317,7 +319,7 @@ async def process_tiktok_video(
                 db_video_url,
                 download_name,
                 download_data=data,
-                user_id=message.from_user.id,
+                user_id=actor_id,
                 chat_id=message.chat.id,
                 request_id=request_id,
                 size_hint=size_hint,
@@ -327,50 +329,14 @@ async def process_tiktok_video(
             timeout=420.0,
         )
 
-    async def _send_cached(file_id: str):
-        logging.info(
-            "Serving cached TikTok video: url=%s file_id=%s",
-            summarize_url_for_log(db_video_url),
-            file_id,
-        )
-        try:
-            if as_document:
-                return await message.reply_document(
-                    document=file_id,
-                    caption=bm.captions(
-                        user_settings["captions"], info.description, bot_url
-                    ),
-                    reply_markup=_reply_markup(),
-                    parse_mode="HTML",
-                    disable_content_type_detection=True,
-                )
-            return await message.reply_video(
-                video=file_id,
-                caption=bm.captions(
-                    user_settings["captions"], info.description, bot_url
-                ),
-                reply_markup=_reply_markup(),
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            return None
-
-    async def _send_downloaded(path: str):
-        if as_document:
-            return await message.reply_document(
-                document=FSInputFile(path),
-                caption=bm.captions(user_settings["captions"], info.description, bot_url),
-                reply_markup=_reply_markup(),
-                parse_mode="HTML",
-                disable_content_type_detection=True,
-            )
-        return await message.reply_video(
-            video=FSInputFile(path),
-            caption=bm.captions(user_settings["captions"], info.description, bot_url),
-            reply_markup=_reply_markup(),
-            parse_mode="HTML",
-            **(await build_video_send_kwargs(path)),
-        )
+    _send_cached, _send_downloaded, _extract_file_id = make_video_or_document_senders(
+        message,
+        caption=bm.captions(user_settings["captions"], info.description, bot_url),
+        reply_markup_fn=_reply_markup,
+        as_document=as_document,
+        cached_log_label="TikTok video",
+        cached_log_url=db_video_url,
+    )
 
     async def _after_send():
         await maybe_delete_user_message(message, user_settings["delete_message"])
@@ -387,12 +353,7 @@ async def process_tiktok_video(
             return False
         return True
 
-    async def _handle_backpressure(exc: Exception) -> None:
-        await handle_download_backpressure_error(
-            exc,
-            message=message,
-            show_service_status=business_id is None,
-        )
+    _handle_backpressure = make_backpressure_handler(message, business_id)
 
     async def _handle_unexpected_error(exc: Exception) -> None:
         if isinstance(exc, asyncio.TimeoutError):
@@ -424,9 +385,7 @@ async def process_tiktok_video(
         send_cached=_send_cached,
         download_media=_download_media,
         send_downloaded=_send_downloaded,
-        extract_file_id=lambda sent: (
-            sent.document.file_id if getattr(sent, "document", None) else (sent.video.file_id if getattr(sent, "video", None) else None)
-        ),
+        extract_file_id=_extract_file_id,
         cleanup_path=remove_file,
         delete_status_message=lambda: safe_delete_message(status_message),
         on_missing_media=lambda: handle_download_error(
@@ -484,19 +443,27 @@ async def process_tiktok_photos(
 
         if as_document and len(images) > 1:
             from utils.zip_utils import create_photos_zip
-            photo_paths = []
-            for index, image_url in enumerate(images):
+
+            async def _download_zip_photo(index: int, image_url: str) -> Optional[str]:
                 download_name = f"{index}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_photo.jpg"
                 try:
-                    path = await tiktok_service.download_media(
+                    return await tiktok_service.download_media(
                         image_url,
                         download_name,
                         user_id=message.from_user.id,
                         chat_id=message.chat.id,
                     )
-                    photo_paths.append(path)
                 except Exception as exc:
                     logging.warning("Failed to download TikTok photo for ZIP: %s", exc)
+                    return None
+
+            downloaded_paths = await asyncio.gather(
+                *(
+                    _download_zip_photo(index, image_url)
+                    for index, image_url in enumerate(images)
+                )
+            )
+            photo_paths = [path for path in downloaded_paths if path]
 
             if photo_paths:
                 zip_name = f"tiktok_photos_{info.id if info else datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
@@ -526,22 +493,28 @@ async def process_tiktok_photos(
                 await maybe_delete_user_message(message, user_settings["delete_message"] if isinstance(user_settings, dict) else "off")
                 return True
 
-        media_items = []
-        for index, image_url in enumerate(images):
-            cache_key = build_media_cache_key(
+        cache_keys = [
+            build_media_cache_key(
                 video_url or image_url, item_index=index, item_kind="photo"
             )
-            cached_file_id = await db.get_file_id(cache_key)
-            media_items.append(
-                {
-                    "index": index,
-                    "kind": "photo",
-                    "cache_key": cache_key,
-                    "file_id": cached_file_id,
-                    "url": image_url,
-                    "cached": bool(cached_file_id),
-                }
+            for index, image_url in enumerate(images)
+        ]
+        cached_file_ids = await asyncio.gather(
+            *(db.get_file_id(cache_key) for cache_key in cache_keys)
+        )
+        media_items = [
+            {
+                "index": index,
+                "kind": "photo",
+                "cache_key": cache_key,
+                "file_id": cached_file_id,
+                "url": image_url,
+                "cached": bool(cached_file_id),
+            }
+            for index, (image_url, cache_key, cached_file_id) in enumerate(
+                zip(images, cache_keys, cached_file_ids)
             )
+        ]
 
         await send_cached_media_entries(
             message,
@@ -652,7 +625,14 @@ async def download_tiktok_doc_callback(call: types.CallbackQuery):
     video_url = f"https://www.tiktok.com/@i/video/{video_id}"
     try:
         data = await fetch_tiktok_data_with_retry(video_url)
-        user_settings = await load_user_settings(db, call.message)
+        # call.message is authored by the bot, so resolve settings from the
+        # pressing user (or the group chat), not from the message author.
+        settings_target_id = (
+            call.message.chat.id
+            if call.message.chat and call.message.chat.type != "private"
+            else call.from_user.id
+        )
+        user_settings = await db.user_settings(settings_target_id)
         override_settings = dict(user_settings)
         override_settings["as_document"] = "on"
         await process_tiktok_video(
@@ -661,6 +641,7 @@ async def download_tiktok_doc_callback(call: types.CallbackQuery):
             await get_bot_url(bot),
             override_settings,
             call.message.business_connection_id,
+            actor_user_id=call.from_user.id,
         )
     except Exception as exc:
         logging.error("Failed to process doc:tiktok callback: video_id=%s error=%s", video_id, exc)
@@ -846,57 +827,20 @@ async def _send_inline_tiktok_video(
     )
 
 
-@router.chosen_inline_result(F.result_id.startswith("tiktok_inline:"))
-@with_chosen_inline_logging("tiktok", "chosen_inline")
-async def chosen_inline_tiktok_result(result: types.ChosenInlineResult):
-    inline_message_id = result.inline_message_id
-    if not inline_message_id:
-        logging.warning(
+chosen_inline_tiktok_result, send_inline_tiktok_video_callback = (
+    register_inline_send_handlers(
+        router,
+        service="tiktok",
+        result_prefix="tiktok_inline:",
+        callback_prefix="inline:tiktok:",
+        send_fn=_send_inline_tiktok_video,
+        missing_inline_message_warning=(
             "Chosen inline TikTok result is missing inline_message_id; enable inline feedback in BotFather"
-        )
-        return
-
-    token = result.result_id.removeprefix("tiktok_inline:")
-    await _send_inline_tiktok_video(
-        token=token,
-        inline_message_id=inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+        ),
+        chosen_handler_name="chosen_inline_tiktok_result",
+        callback_handler_name="send_inline_tiktok_video_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:tiktok:"))
-@with_callback_logging("tiktok", "inline_callback")
-async def send_inline_tiktok_video_callback(call: types.CallbackQuery):
-    token = call.data.removeprefix("inline:tiktok:")
-    inline_message_id = call.inline_message_id
-    if not inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    await call.answer()
-    try:
-        await _send_inline_tiktok_video(
-            token=token,
-            inline_message_id=inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-        return
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-            return
-        if str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
-            return
-        await call.answer(bm.something_went_wrong(), show_alert=True)
+)
 
 
 @router.callback_query(

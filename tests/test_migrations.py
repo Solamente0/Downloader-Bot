@@ -138,3 +138,58 @@ def test_analytics_user_id_index_migration_creates_missing(monkeypatch):
     assert create_index.call_count == 2
     create_index.assert_any_call("ix_analytics_events_user_id", "analytics_events", ["user_id"], unique=False)
     create_index.assert_any_call("ix_downloaded_files_date_added", "downloaded_files", ["date_added"], unique=False)
+
+
+def test_redundant_analytics_index_migration_drops_only_existing(monkeypatch):
+    module = _load_migration_module("20260726_000010_drop_redundant_analytics_indexes.py")
+    drop_index = Mock()
+    monkeypatch.setattr(module.op, "drop_index", drop_index)
+    monkeypatch.setattr(module.op, "get_bind", lambda: object())
+    monkeypatch.setattr(
+        module.sa,
+        "inspect",
+        lambda _bind: SimpleNamespace(
+            get_indexes=lambda _table: [
+                {"name": "ix_analytics_events_created_at"},
+                {"name": "ix_analytics_events_created_action"},
+            ]
+        ),
+    )
+
+    module.upgrade()
+
+    drop_index.assert_called_once_with("ix_analytics_events_created_at", table_name="analytics_events")
+
+
+def test_redundant_analytics_index_migration_skips_missing(monkeypatch):
+    module = _load_migration_module("20260726_000010_drop_redundant_analytics_indexes.py")
+    drop_index = Mock()
+    monkeypatch.setattr(module.op, "drop_index", drop_index)
+    monkeypatch.setattr(module.op, "get_bind", lambda: object())
+    monkeypatch.setattr(
+        module.sa,
+        "inspect",
+        lambda _bind: SimpleNamespace(get_indexes=lambda _table: []),
+    )
+
+    module.upgrade()
+
+    drop_index.assert_not_called()
+
+
+def test_redundant_analytics_index_migration_downgrade_recreates_missing(monkeypatch):
+    module = _load_migration_module("20260726_000010_drop_redundant_analytics_indexes.py")
+    create_index = Mock()
+    monkeypatch.setattr(module.op, "create_index", create_index)
+    monkeypatch.setattr(module.op, "get_bind", lambda: object())
+    monkeypatch.setattr(
+        module.sa,
+        "inspect",
+        lambda _bind: SimpleNamespace(get_indexes=lambda _table: []),
+    )
+
+    module.downgrade()
+
+    assert create_index.call_count == 2
+    create_index.assert_any_call("ix_analytics_events_created_at", "analytics_events", ["created_at"], unique=False)
+    create_index.assert_any_call("ix_analytics_events_action_name", "analytics_events", ["action_name"], unique=False)

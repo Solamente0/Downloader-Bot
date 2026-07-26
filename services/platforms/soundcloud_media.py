@@ -1,17 +1,13 @@
 import hashlib
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
-from urllib.parse import urlparse, urlunparse
 
 from services.logger import logger as logging
 from services.media.artist_names import normalize_artist_names
+from services.platforms import CobaltMediaService, strip_url_query
 from utils.download_manager import (
-    DownloadConfig,
-    DownloadError,
+    DownloadError as DownloadError,  # noqa: F401  (re-exported for handlers)
     DownloadMetrics,
-    DownloadQueueBusyError,
-    DownloadRateLimitError,
-    ResilientDownloader,
 )
 
 logging = logging.bind(service="soundcloud_media")
@@ -28,12 +24,7 @@ class SoundCloudTrack:
     duration_seconds: int = 0
 
 
-def strip_soundcloud_url(url: str) -> str:
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return url
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, "", ""))
+strip_soundcloud_url = strip_url_query
 
 
 def _looks_like_image_url(url: str) -> bool:
@@ -161,7 +152,7 @@ def parse_soundcloud_track(data: dict, source_url: str) -> Optional[SoundCloudTr
     )
 
 
-class SoundCloudMediaService:
+class SoundCloudMediaService(CobaltMediaService):
     def __init__(
         self,
         output_dir: str,
@@ -171,17 +162,16 @@ class SoundCloudMediaService:
         fetch_cobalt_data_func: Callable[..., Awaitable[dict | None]],
         retry_async_operation_func: Callable[..., Awaitable[DownloadMetrics | None]],
     ) -> None:
-        config = DownloadConfig(
-            chunk_size=1024 * 1024,
-            multipart_threshold=16 * 1024 * 1024,
-            max_workers=6,
-            retry_backoff=0.8,
+        super().__init__(
+            output_dir,
+            source="soundcloud",
+            cobalt_api_url=cobalt_api_url,
+            cobalt_api_key=cobalt_api_key,
+            fetch_cobalt_data_func=fetch_cobalt_data_func,
+            retry_async_operation_func=retry_async_operation_func,
+            logger=logging,
+            download_error_message="Error downloading SoundCloud media: url=%s error=%s",
         )
-        self._downloader = ResilientDownloader(output_dir, config=config, source="soundcloud")
-        self._cobalt_api_url = cobalt_api_url
-        self._cobalt_api_key = cobalt_api_key
-        self._fetch_cobalt_data = fetch_cobalt_data_func
-        self._retry_async_operation = retry_async_operation_func
 
     async def fetch_track(self, url: str) -> Optional[SoundCloudTrack]:
         payload = {
@@ -193,52 +183,7 @@ class SoundCloudMediaService:
             "localProcessing": "preferred",
             "disableMetadata": False,
         }
-        data = await self._fetch_cobalt_data(
-            self._cobalt_api_url,
-            self._cobalt_api_key,
-            payload,
-            source="soundcloud",
-            timeout=15,
-            attempts=3,
-        )
+        data = await self._fetch_cobalt_json(payload)
         if not data:
             return None
         return parse_soundcloud_track(data, url)
-
-    async def download_media(
-        self,
-        url: str,
-        filename: str,
-        *,
-        user_id: Optional[int] = None,
-        chat_id: Optional[int] = None,
-        request_id: Optional[str] = None,
-        size_hint: Optional[int] = None,
-        on_queued=None,
-        on_progress=None,
-        on_retry=None,
-    ) -> Optional[DownloadMetrics]:
-        async def _download_once():
-            return await self._downloader.download(
-                url,
-                filename,
-                user_id=user_id,
-                chat_id=chat_id,
-                request_id=request_id,
-                size_hint=size_hint,
-                on_queued=on_queued,
-                on_progress=on_progress,
-            )
-
-        try:
-            return await self._retry_async_operation(
-                _download_once,
-                attempts=3,
-                retry_on_exception=lambda exc: not isinstance(exc, (DownloadRateLimitError, DownloadQueueBusyError)),
-                on_retry=on_retry,
-            )
-        except (DownloadRateLimitError, DownloadQueueBusyError):
-            raise
-        except DownloadError as exc:
-            logging.error("Error downloading SoundCloud media: url=%s error=%s", url, exc)
-            return None

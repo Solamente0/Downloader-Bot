@@ -21,6 +21,7 @@ from aiogram.types import BufferedInputFile
 
 import keyboards as kb
 import messages as bm
+import messages.admin_messages as bm_admin
 from app_context import bot, db
 from config import ADMINS_UID, OUTPUT_DIR
 from filters import IsBotAdmin
@@ -271,12 +272,16 @@ async def _deliver_mailing_message(user, *, sender_id: int, message_id: int) -> 
         )
         if user_status == "inactive":
             await db.set_active(user_id)
-    except Exception as error:
-        error_text = str(error)
-        if error_text == "Forbidden: bots can't send messages to bots":
+    except TelegramForbiddenError as error:
+        if "bots can't send messages to bots" in error.message:
             await db.delete_user(user_id)
-        if "blocked" in error_text or "Chat not found" in error_text:
+        elif "blocked" in error.message:
             await db.set_inactive(user_id)
+    except TelegramBadRequest as error:
+        if "chat not found" in error.message.lower():
+            await db.set_inactive(user_id)
+    except Exception as error:
+        logging.warning("Failed to deliver mailing message to %s: %s", user_id, error)
     finally:
         await asyncio.sleep(_ADMIN_THROTTLE_SECONDS)
 
@@ -286,10 +291,6 @@ class Mailing(StatesGroup):
 
 
 class Admin(StatesGroup):
-    add_joke = State()
-    control_user = State()
-    ban_reason = State()
-    feedback_answer = State()
     write_message = State()
     write_chat_id = State()
     write_chat_text = State()
@@ -418,9 +419,9 @@ async def _render_health_text(*, include_queue: bool = True, include_runtime_dow
     return "\n".join(lines)
 
 
-def _render_downloads_text(*, footer: str | None = None, include_cleanup_load: bool = True) -> str:
+async def _render_downloads_text(*, footer: str | None = None, include_cleanup_load: bool = True) -> str:
     queue_snapshot = get_download_queue().load_snapshot()
-    snapshot = _build_directory_snapshot(OUTPUT_DIR)
+    snapshot = await asyncio.to_thread(_build_directory_snapshot, OUTPUT_DIR)
     cleanup_ready = queue_snapshot.active_jobs == 0 and queue_snapshot.queued_jobs == 0
     lines = [
         "<b>Downloads Storage</b>",
@@ -451,9 +452,9 @@ async def _render_ops_text() -> str:
     return f"{health_text}\n\n{perf_text}"
 
 
-def _render_runtime_storage_text(*, footer: str | None = None) -> str:
+async def _render_runtime_storage_text(*, footer: str | None = None) -> str:
     session_text = _render_session_text()
-    downloads_text = _render_downloads_text(footer=footer, include_cleanup_load=False)
+    downloads_text = await _render_downloads_text(footer=footer, include_cleanup_load=False)
     return f"{session_text}\n\n{downloads_text}"
 
 
@@ -485,7 +486,7 @@ async def _cleanup_downloads_once() -> str:
         return bm.downloads_cleanup_blocked(queue_snapshot.active_jobs, queue_snapshot.queued_jobs)
     if not os.path.exists(OUTPUT_DIR):
         return f"The folder '{OUTPUT_DIR}' does not exist."
-    removed_files, skipped_recent_files, removed_dirs = _cleanup_download_tree()
+    removed_files, skipped_recent_files, removed_dirs = await asyncio.to_thread(_cleanup_download_tree)
     return bm.downloads_cleanup_finished(removed_files, removed_dirs, skipped_recent_files)
 
 
@@ -536,7 +537,7 @@ async def admin_runtime_storage(call: types.CallbackQuery):
     await call.answer()
     queue_snapshot = get_download_queue().load_snapshot()
     await call.message.edit_text(
-        text=_render_runtime_storage_text(),
+        text=await _render_runtime_storage_text(),
         reply_markup=kb.downloads_admin_keyboard(
             can_cleanup=queue_snapshot.active_jobs == 0 and queue_snapshot.queued_jobs == 0,
             refresh_callback="admin_runtime_storage",
@@ -588,7 +589,7 @@ async def admin_downloads(call: types.CallbackQuery):
     await call.answer()
     queue_snapshot = get_download_queue().load_snapshot()
     await call.message.edit_text(
-        text=_render_downloads_text(),
+        text=await _render_downloads_text(),
         reply_markup=kb.downloads_admin_keyboard(
             can_cleanup=queue_snapshot.active_jobs == 0 and queue_snapshot.queued_jobs == 0
         ),
@@ -604,7 +605,7 @@ async def admin_cleanup_downloads(call: types.CallbackQuery):
     await call.answer("Cleanup finished" if "finished" in status_text else "Cleanup skipped")
     queue_snapshot = get_download_queue().load_snapshot()
     await call.message.edit_text(
-        text=_render_runtime_storage_text(footer=status_text),
+        text=await _render_runtime_storage_text(footer=status_text),
         reply_markup=kb.downloads_admin_keyboard(
             can_cleanup=queue_snapshot.active_jobs == 0 and queue_snapshot.queued_jobs == 0,
             refresh_callback="admin_runtime_storage",
@@ -898,7 +899,7 @@ async def send_to_all_message(message: types.Message, state: FSMContext):
                                text=bm.start_mailing(),
                                reply_markup=types.ReplyKeyboardRemove())
 
-        users = await db.get_all_users_info()
+        users = [user for user in await db.get_all_users_info() if (user.status or "inactive") != "ban"]
         await _run_bounded(
             users,
             limit=_ADMIN_MAILING_CONCURRENCY,
@@ -956,7 +957,7 @@ async def write_message(message: types.Message, state: FSMContext):
 
     except Exception as e:
         logging.error(e)
-        await message.reply(bm.something_went_wrong(),
+        await message.reply(bm_admin.something_went_wrong(),
                             reply_markup=kb.return_back_to_admin_keyboard())
 
 

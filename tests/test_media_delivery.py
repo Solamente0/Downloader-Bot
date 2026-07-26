@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
 import pytest
 
@@ -298,3 +299,177 @@ async def test_send_cached_media_entries_splits_large_albums_into_multiple_batch
     assert len(second_batch_kwargs["media"]) == 2
     assert message.answer_photo.await_args.kwargs["photo"].path == "/tmp/12.jpg"
     assert db_service.add_file.await_count == 13
+
+
+@pytest.mark.asyncio
+async def test_send_cached_media_entries_probes_all_batch_videos_and_caches_group(monkeypatch):
+    probe = AsyncMock(return_value={"supports_streaming": True})
+    monkeypatch.setattr(delivery, "build_video_send_kwargs", probe)
+    message = SimpleNamespace(
+        message_id=5,
+        answer_media_group=AsyncMock(
+            return_value=[
+                SimpleNamespace(video=SimpleNamespace(file_id="album-video-0")),
+                SimpleNamespace(video=SimpleNamespace(file_id="album-video-1")),
+            ]
+        ),
+        answer_photo=AsyncMock(return_value=SimpleNamespace(photo=[SimpleNamespace(file_id="last-photo-id")])),
+        reply_photo=AsyncMock(),
+        answer_video=AsyncMock(),
+        reply_video=AsyncMock(),
+    )
+    db_service = SimpleNamespace(add_file=AsyncMock())
+    entries = [
+        {
+            "kind": "video",
+            "cache_key": "album#0",
+            "file_id": None,
+            "path": "/tmp/0.mp4",
+            "cached": False,
+        },
+        {
+            "kind": "video",
+            "cache_key": "album#1",
+            "file_id": None,
+            "path": "/tmp/1.mp4",
+            "cached": False,
+        },
+        {
+            "kind": "photo",
+            "cache_key": "album#2",
+            "file_id": None,
+            "path": "/tmp/2.jpg",
+            "cached": False,
+        },
+    ]
+
+    await send_cached_media_entries(
+        message,
+        entries,
+        db_service=db_service,
+        caption="caption",
+        reply_markup=None,
+    )
+
+    assert probe.await_count == 2
+    assert sorted(call.args[0] for call in probe.await_args_list) == ["/tmp/0.mp4", "/tmp/1.mp4"]
+    media = message.answer_media_group.await_args.kwargs["media"]
+    assert len(media) == 2
+    assert db_service.add_file.await_count == 3
+    cached_calls = {call.args[0]: call.args[1] for call in db_service.add_file.await_args_list}
+    assert cached_calls == {
+        "album#0": "album-video-0",
+        "album#1": "album-video-1",
+        "album#2": "last-photo-id",
+    }
+
+
+def _make_sender_message():
+    return SimpleNamespace(
+        reply_video=AsyncMock(
+            return_value=SimpleNamespace(
+                document=None, video=SimpleNamespace(file_id="video-file-id")
+            )
+        ),
+        reply_document=AsyncMock(
+            return_value=SimpleNamespace(
+                document=SimpleNamespace(file_id="doc-file-id"), video=None
+            )
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_make_video_or_document_senders_sends_cached_video():
+    message = _make_sender_message()
+    reply_markup = object()
+    send_cached, _send_downloaded, extract_file_id = (
+        delivery.make_video_or_document_senders(
+            message,
+            caption="caption",
+            reply_markup_fn=lambda: reply_markup,
+            as_document=False,
+            cached_log_label="TikTok video",
+            cached_log_url="https://www.tiktok.com/@creator/video/123",
+        )
+    )
+
+    sent = await send_cached("cached-file-id")
+
+    message.reply_video.assert_awaited_once_with(
+        video="cached-file-id",
+        caption="caption",
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
+    message.reply_document.assert_not_awaited()
+    assert extract_file_id(sent) == "video-file-id"
+
+
+@pytest.mark.asyncio
+async def test_make_video_or_document_senders_cached_bad_request_returns_none():
+    message = _make_sender_message()
+    message.reply_video.side_effect = TelegramBadRequest(
+        method=SimpleNamespace(__api_method__="sendVideo"),
+        message="Telegram server says - Bad Request: wrong file identifier",
+    )
+    send_cached, _send_downloaded, _extract_file_id = (
+        delivery.make_video_or_document_senders(
+            message,
+            caption=None,
+            reply_markup_fn=lambda: None,
+            as_document=False,
+            cached_log_label="TikTok video",
+        )
+    )
+
+    assert await send_cached("stale-file-id") is None
+
+
+@pytest.mark.asyncio
+async def test_make_video_or_document_senders_sends_downloaded_document(monkeypatch):
+    probe = AsyncMock(return_value={})
+    monkeypatch.setattr(delivery, "build_video_send_kwargs", probe)
+    message = _make_sender_message()
+    _send_cached, send_downloaded, extract_file_id = (
+        delivery.make_video_or_document_senders(
+            message,
+            caption="caption",
+            reply_markup_fn=lambda: None,
+            as_document=True,
+            cached_log_label="Instagram video",
+        )
+    )
+
+    sent = await send_downloaded("/tmp/video.mp4")
+
+    probe.assert_not_awaited()
+    kwargs = message.reply_document.await_args.kwargs
+    assert isinstance(kwargs["document"], FSInputFile)
+    assert kwargs["disable_content_type_detection"] is True
+    message.reply_video.assert_not_awaited()
+    assert extract_file_id(sent) == "doc-file-id"
+
+
+@pytest.mark.asyncio
+async def test_make_video_or_document_senders_sends_downloaded_video(monkeypatch):
+    probe = AsyncMock(return_value={"width": 640, "height": 360})
+    monkeypatch.setattr(delivery, "build_video_send_kwargs", probe)
+    message = _make_sender_message()
+    _send_cached, send_downloaded, _extract_file_id = (
+        delivery.make_video_or_document_senders(
+            message,
+            caption="caption",
+            reply_markup_fn=lambda: None,
+            as_document=False,
+            cached_log_label="YouTube video",
+        )
+    )
+
+    await send_downloaded("/tmp/video.mp4")
+
+    probe.assert_awaited_once_with("/tmp/video.mp4")
+    kwargs = message.reply_video.await_args.kwargs
+    assert isinstance(kwargs["video"], FSInputFile)
+    assert kwargs["width"] == 640
+    assert kwargs["height"] == 360

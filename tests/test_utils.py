@@ -1,4 +1,6 @@
+import asyncio
 import itertools
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,7 +11,9 @@ import pytest
 from handlers import bot_profile_cache, telegram_ui_utils
 from handlers import utils
 from services.logger import summarize_text_for_log, summarize_url_for_log
+from utils import http_client
 from utils.download_manager import DownloadProgress, DownloadTooLargeError
+from utils.zip_utils import create_photos_zip
 import logging
 
 
@@ -565,3 +569,71 @@ def test_summarize_text_for_log_avoids_raw_text_echo():
 
     assert summary.startswith("text|len=")
     assert "private note" not in summary
+
+
+def test_create_photos_zip_stores_existing_files_without_recompression(tmp_path):
+    first = tmp_path / "a.jpg"
+    first.write_bytes(b"jpeg-bytes-1")
+    second = tmp_path / "b.png"
+    second.write_bytes(b"png-bytes-2")
+    missing = tmp_path / "missing.jpg"
+    zip_path = tmp_path / "out" / "photos.zip"
+
+    result = create_photos_zip([str(first), str(missing), str(second)], str(zip_path))
+
+    assert result == str(zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        infos = archive.infolist()
+        assert [info.filename for info in infos] == ["photo_01.jpg", "photo_03.png"]
+        assert all(info.compress_type == zipfile.ZIP_STORED for info in infos)
+        assert archive.read("photo_01.jpg") == b"jpeg-bytes-1"
+        assert archive.read("photo_03.png") == b"png-bytes-2"
+
+
+def test_get_http_session_recreates_lock_and_session_after_loop_change(monkeypatch):
+    connectors = []
+
+    class DummyConnector:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            connectors.append(self)
+
+        def close(self):
+            async def _mark_closed():
+                self.closed = True
+
+            return _mark_closed()
+
+    class DummySession:
+        def __init__(self, *, timeout, connector):
+            self.timeout = timeout
+            self.connector = connector
+            self.closed = False
+            self.detached = False
+
+        def detach(self):
+            self.detached = True
+            self.closed = True
+            self.connector = None
+
+    monkeypatch.setattr(http_client.aiohttp, "TCPConnector", DummyConnector)
+    monkeypatch.setattr(http_client.aiohttp, "ClientSession", DummySession)
+    monkeypatch.setattr(http_client, "_session", None)
+    monkeypatch.setattr(http_client, "_session_loop", None)
+    monkeypatch.setattr(http_client, "_lock", asyncio.Lock())
+    monkeypatch.setattr(http_client, "_lock_loop", None)
+
+    first = asyncio.run(http_client.get_http_session())
+    lock_after_first = http_client._lock
+    second = asyncio.run(http_client.get_http_session())
+
+    assert second is not first
+    assert http_client._lock is not lock_after_first
+    # The old-loop session must be detached, never close()-awaited on the new loop.
+    assert first.detached is True
+    assert connectors[0].closed is True
+    assert second.closed is False
+
+    asyncio.run(http_client.close_http_session())
+    assert second.detached is True

@@ -65,6 +65,59 @@ def test_tiktok_ytdlp_download_options_do_not_retry_inside_service_attempt(tmp_p
     assert options["fragment_retries"] == 0
 
 
+def test_tiktok_ie_exposes_private_web_data_extractor():
+    from yt_dlp.extractor.tiktok import TikTokIE
+
+    assert callable(getattr(TikTokIE, "_extract_web_data_and_status", None))
+
+
+def test_extract_tiktok_detail_sync_degrades_when_extractor_internals_change(tmp_path, monkeypatch):
+    service = _make_service(tmp_path)
+
+    class BrokenTikTokIE:
+        def __init__(self, _ydl):
+            pass
+
+        def _extract_web_data_and_status(self, *_args, **_kwargs):
+            raise TypeError("signature changed")
+
+    monkeypatch.setattr(
+        "services.platforms.tiktok_metadata_mixin.TikTokIE", BrokenTikTokIE
+    )
+
+    detail, status = service._extract_tiktok_detail_sync(
+        "https://www.tiktok.com/@creator/video/123"
+    )
+
+    assert detail == {}
+    assert status == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_user_info_sleeps_between_missing_sec_uid_retries(tmp_path, monkeypatch):
+    service = _make_service(tmp_path)
+    service.USER_LOOKUP_MAX_RETRIES = 3
+    service.USER_LOOKUP_RETRY_DELAY_SECONDS = 0.01
+
+    fake_session = _FakeSession({"nickname": "someone"})
+    service._get_http_session = AsyncMock(return_value=fake_session)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        "services.platforms.tiktok_profile_mixin.asyncio.sleep", fake_sleep
+    )
+
+    result = await service.fetch_user_info("missing_user")
+
+    assert result is None
+    assert len(fake_session.get_calls) == 3
+    assert sleeps == [0.01, 0.01, 0.01]
+
+
 @pytest.mark.asyncio
 async def test_fetch_tiktok_data_builds_legacy_video_payload(tmp_path, monkeypatch):
     service = _make_service(tmp_path)

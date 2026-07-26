@@ -12,8 +12,6 @@ from services.download.queue import get_download_queue  # noqa: F401
 from services.runtime.pending_requests import pop_pending  # noqa: F401
 from services.stats.chart import _render_stats  # noqa: F401
 
-from config import BATCH_LINKS_MAX_ITEMS
-
 from handlers import commands as cmd_mod
 from handlers import media_download as media_mod
 from handlers import settings_menu as settings_mod
@@ -22,7 +20,7 @@ router = Router(name=__name__)
 
 _UPDATE_INFO_TTL_SECONDS = cmd_mod._UPDATE_INFO_TTL_SECONDS
 _update_info_cache = cmd_mod._update_info_cache
-_MAX_BATCH_LINKS = max(1, int(BATCH_LINKS_MAX_ITEMS))
+_MAX_BATCH_LINKS = media_mod._MAX_BATCH_LINKS
 _MESSAGE_NOT_MODIFIED_MARKERS = (
     "message is not modified",
     "specified new message content and reply markup are exactly the same",

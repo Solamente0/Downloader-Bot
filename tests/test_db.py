@@ -28,8 +28,17 @@ def test_map_action_to_service_includes_soundcloud():
 def test_analytics_event_model_declares_stats_indexes():
     index_names = {index.name for index in db_module.AnalyticsEvent.__table__.indexes}
 
-    assert "ix_analytics_events_created_at" in index_names
     assert "ix_analytics_events_action_name_created_at" in index_names
+    assert "ix_analytics_events_created_action" in index_names
+    assert "ix_analytics_events_created_at" not in index_names
+    assert "ix_analytics_events_action_name" not in index_names
+
+
+def test_stats_period_start_is_timezone_aware_utc():
+    start = db_module.DataBase._stats_period_start("Week")
+
+    assert start.tzinfo is not None
+    assert start.utcoffset() == timedelta(0)
 
 
 def test_select_schema_migration_action_prefers_upgrade_for_empty_schema():
@@ -156,8 +165,8 @@ async def database(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_add_user_and_settings(database):
-    await database.add_user(
+async def test_upsert_chat_and_settings(database):
+    await database.upsert_chat(
         user_id=1,
         user_name="Alice",
         user_username="alice",
@@ -166,9 +175,8 @@ async def test_add_user_and_settings(database):
         status="active",
     )
 
-    assert await database.user_exist(1) is True
-
     info = await database.get_user_info(1)
+    assert info is not None
     assert info[0] == "Alice"
     assert info[1] == "alice"
     assert info[2] == "active"
@@ -238,7 +246,7 @@ async def test_upsert_chat_creates_and_updates(database):
 
 @pytest.mark.asyncio
 async def test_user_status_transitions(database):
-    await database.add_user(
+    await database.upsert_chat(
         user_id=2,
         user_name="Bob",
         user_username="bob",
@@ -257,7 +265,7 @@ async def test_user_status_transitions(database):
     assert await database.status(2) == "ban"
 
     await database.delete_user(2)
-    assert await database.user_exist(2) is False
+    assert await database.get_user_info(2) is None
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from handlers.utils import (
     maybe_delete_user_message,
     react_to_message,
     remove_file,
+    register_inline_send_handlers,
     retry_async_operation,
     safe_delete_message,
     safe_edit_text,
@@ -32,8 +33,6 @@ from handlers.utils import (
     safe_answer_inline_query,
     send_chat_action_if_needed,
     should_skip_duplicate_business_message,
-    with_callback_logging,
-    with_chosen_inline_logging,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
@@ -63,6 +62,7 @@ from services.media.delivery import (
     coerce_audio_duration_seconds,
     send_audio_with_thumbnail,
 )
+from services.media.audio_flow import run_audio_flow
 from services.media.audio_metadata import build_audio_filename, prepare_mp3_metadata
 from services.platforms import soundcloud_media as soundcloud_platform
 
@@ -110,8 +110,6 @@ soundcloud_service = SoundCloudService(OUTPUT_DIR)
 @with_message_logging("soundcloud", "message")
 async def process_soundcloud(message: types.Message, direct_url: Optional[str] = None):
     status_message: Optional[types.Message] = None
-    audio_path: Optional[str] = None
-    prepared_metadata = None
     request_lease = None
     try:
         business_id = message.business_connection_id
@@ -154,110 +152,129 @@ async def process_soundcloud(message: types.Message, direct_url: Optional[str] =
             status_message = await message.answer(bm.downloading_audio_status())
 
         cache_key = build_audio_cache_key(source_url)
-        db_file_id = await db.get_file_id(cache_key)
-        track = None
-        if db_file_id:
-            await safe_edit_text(status_message, bm.uploading_status())
-            await send_chat_action_if_needed(
-                bot, message.chat.id, "upload_audio", business_id
-            )
-            await send_audio_with_thumbnail(
-                message.reply_audio,
-                audio=db_file_id,
-                caption=bm.captions(user_settings["captions"], None, bot_url),
-                bot_url=bot_url,
-                parse_mode="HTML",
-            )
-            await maybe_delete_user_message(message, user_settings["delete_message"])
-            request_lease.mark_success()
-            return
-
-        track = await soundcloud_service.fetch_track(source_url)
-        if not track:
-            await handle_download_error(message, business_id=business_id)
-            return
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        request_id = (
-            f"soundcloud_audio:{message.chat.id}:{message.message_id}:{track.id}"
-        )
-        audio_name = f"{track.id}_{timestamp}_soundcloud_audio.mp3"
+        track: Optional[SoundCloudTrack] = None
 
         async def _edit_status(text: str) -> None:
             await safe_edit_text(status_message, text)
 
-        on_progress = make_status_text_progress_updater(
-            "SoundCloud audio", _edit_status
-        )
-        on_retry = make_retry_status_notifier(
-            _edit_status,
-            enabled=show_service_status,
-        )
+        async def _send_cached(file_id: str):
+            await safe_edit_text(status_message, bm.uploading_status())
+            await send_chat_action_if_needed(
+                bot, message.chat.id, "upload_audio", business_id
+            )
+            return await send_audio_with_thumbnail(
+                message.reply_audio,
+                audio=file_id,
+                caption=bm.captions(user_settings["captions"], None, bot_url),
+                bot_url=bot_url,
+                parse_mode="HTML",
+            )
 
-        audio_metrics = await soundcloud_service.download_media(
-            track.audio_url,
-            audio_name,
-            user_id=message.from_user.id,
-            chat_id=message.chat.id,
-            request_id=request_id,
-            on_progress=on_progress,
-            on_retry=on_retry,
-        )
-        if not audio_metrics:
+        async def _fetch_track() -> bool:
+            nonlocal track
+            track = await soundcloud_service.fetch_track(source_url)
+            if not track:
+                await handle_download_error(message, business_id=business_id)
+                return False
+            return True
+
+        async def _download_audio():
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            request_id = (
+                f"soundcloud_audio:{message.chat.id}:{message.message_id}:{track.id}"
+            )
+            audio_name = f"{track.id}_{timestamp}_soundcloud_audio.mp3"
+
+            on_progress = make_status_text_progress_updater(
+                "SoundCloud audio", _edit_status
+            )
+            on_retry = make_retry_status_notifier(
+                _edit_status,
+                enabled=show_service_status,
+            )
+
+            audio_metrics = await soundcloud_service.download_media(
+                track.audio_url,
+                audio_name,
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                request_id=request_id,
+                on_progress=on_progress,
+                on_retry=on_retry,
+            )
+            if audio_metrics:
+                log_download_metrics("soundcloud_audio", audio_metrics)
+            return audio_metrics
+
+        async def _prepare_metadata(path: str):
+            return await prepare_mp3_metadata(
+                path,
+                {
+                    "title": track.title,
+                    "artists": track.artist,
+                    "thumbnail": track.thumbnail_url,
+                    "source_url": source_url,
+                },
+            )
+
+        async def _send_downloaded(path: str, prepared_metadata):
+            await safe_edit_text(status_message, bm.uploading_status())
+            await send_chat_action_if_needed(
+                bot, message.chat.id, "upload_audio", business_id
+            )
+
+            audio_thumbnail = (
+                FSInputFile(str(prepared_metadata.thumbnail_path), filename="cover.jpg")
+                if prepared_metadata.thumbnail_path
+                else bot_avatar
+            )
+            return await send_audio_with_thumbnail(
+                message.reply_audio,
+                audio=FSInputFile(
+                    path,
+                    filename=build_audio_filename(track.title),
+                ),
+                title=track.title,
+                performer=track.artist or None,
+                caption=bm.captions(user_settings["captions"], None, bot_url),
+                audio_path=path,
+                bot_avatar=audio_thumbnail,
+                bot_url=bot_url,
+                duration=track.duration_seconds,
+                embed_thumbnail=False,
+                parse_mode="HTML",
+            )
+
+        async def _after_send(_result):
+            await maybe_delete_user_message(message, user_settings["delete_message"])
+            request_lease.mark_success()
+
+        async def _on_missing_audio():
             await handle_download_error(message, business_id=business_id)
-            return
 
-        log_download_metrics("soundcloud_audio", audio_metrics)
-        audio_path = audio_metrics.path
-        if audio_metrics.size >= MAX_FILE_SIZE:
+        async def _on_too_large():
             await message.reply(bm.audio_too_large())
-            return
 
-        prepared_metadata = await prepare_mp3_metadata(
-            audio_path,
-            {
-                "title": track.title,
-                "artists": track.artist,
-                "thumbnail": track.thumbnail_url,
-                "source_url": source_url,
-            },
-        )
-
-        await safe_edit_text(status_message, bm.uploading_status())
-        await send_chat_action_if_needed(
-            bot, message.chat.id, "upload_audio", business_id
-        )
-
-        audio_thumbnail = (
-            FSInputFile(str(prepared_metadata.thumbnail_path), filename="cover.jpg")
-            if prepared_metadata.thumbnail_path
-            else bot_avatar
-        )
-        sent = await send_audio_with_thumbnail(
-            message.reply_audio,
-            audio=FSInputFile(
-                audio_path,
-                filename=build_audio_filename(track.title),
-            ),
-            title=track.title,
-            performer=track.artist or None,
-            caption=bm.captions(user_settings["captions"], None, bot_url),
-            audio_path=audio_path,
-            bot_avatar=audio_thumbnail,
-            bot_url=bot_url,
-            duration=track.duration_seconds,
-            embed_thumbnail=False,
-            parse_mode="HTML",
-        )
-
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-        request_lease.mark_success()
-        try:
-            await db.add_file(cache_key, sent.audio.file_id, "audio")
-        except Exception as exc:
+        async def _on_cache_store_error(exc: Exception) -> None:
             logging.error(
                 "Error caching SoundCloud audio: key=%s error=%s", cache_key, exc
             )
+
+        await run_audio_flow(
+            cache_key=cache_key,
+            db_service=db,
+            send_cached=_send_cached,
+            fetch_metadata=_fetch_track,
+            download_audio=_download_audio,
+            on_missing_audio=_on_missing_audio,
+            max_file_size=MAX_FILE_SIZE,
+            on_too_large=_on_too_large,
+            prepare_metadata=_prepare_metadata,
+            send_downloaded=_send_downloaded,
+            cleanup_path=remove_file,
+            on_cache_store_error=_on_cache_store_error,
+            on_after_send=_after_send,
+        )
 
     except (DownloadRateLimitError, DownloadQueueBusyError) as exc:
         show_service_status = message.business_connection_id is None
@@ -271,10 +288,6 @@ async def process_soundcloud(message: types.Message, direct_url: Optional[str] =
         if request_lease is not None:
             request_lease.finish()
         await safe_delete_message(status_message)
-        if audio_path:
-            await remove_file(audio_path)
-        if prepared_metadata:
-            prepared_metadata.cleanup()
         await update_info(message)
 
 
@@ -361,9 +374,6 @@ async def _send_inline_soundcloud_audio(
     if request is None:
         return
 
-    audio_path: Optional[str] = None
-    prepared_metadata = None
-
     async def _edit_inline_status(
         text: str, *, with_retry_button: bool = False
     ) -> None:
@@ -389,8 +399,11 @@ async def _send_inline_soundcloud_audio(
             await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
             return
 
-        db_file_id = await db.get_file_id(cache_key)
-        if not db_file_id:
+        async def _send_cached(_file_id: str):
+            await _edit_inline_status(bm.uploading_status())
+            return None
+
+        async def _download_audio():
             timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
             request_id = f"soundcloud_inline:{request.owner_user_id}:{request_event_id}:{track.id}"
             audio_name = f"{track.id}_{timestamp}_soundcloud_inline.mp3"
@@ -401,28 +414,27 @@ async def _send_inline_soundcloud_audio(
                 "SoundCloud audio", _edit_inline_status
             )
 
-            metrics = await soundcloud_service.download_media(
+            return await soundcloud_service.download_media(
                 track.audio_url,
                 audio_name,
                 user_id=request.owner_user_id,
                 request_id=request_id,
                 on_progress=on_progress,
             )
-            if not metrics:
-                reset_inline_video_request(token)
-                await _edit_inline_status(
-                    bm.something_went_wrong(), with_retry_button=True
-                )
-                return
 
-            audio_path = metrics.path
-            if metrics.size >= MAX_FILE_SIZE:
-                complete_inline_video_request(token)
-                await _edit_inline_status(bm.audio_too_large())
-                return
+        async def _on_missing_audio():
+            reset_inline_video_request(token)
+            await _edit_inline_status(
+                bm.something_went_wrong(), with_retry_button=True
+            )
 
-            prepared_metadata = await prepare_mp3_metadata(
-                audio_path,
+        async def _on_too_large():
+            complete_inline_video_request(token)
+            await _edit_inline_status(bm.audio_too_large())
+
+        async def _prepare_metadata(path: str):
+            return await prepare_mp3_metadata(
+                path,
                 {
                     "title": track.title,
                     "artists": track.artist,
@@ -431,38 +443,49 @@ async def _send_inline_soundcloud_audio(
                 },
             )
 
+        async def _send_downloaded(path: str, prepared_metadata):
             await _edit_inline_status(bm.uploading_status())
             audio_thumbnail = (
                 FSInputFile(str(prepared_metadata.thumbnail_path), filename="cover.jpg")
                 if prepared_metadata.thumbnail_path
                 else bot_avatar
             )
-            sent = await send_audio_with_thumbnail(
+            return await send_audio_with_thumbnail(
                 bot.send_audio,
                 chat_id=CHANNEL_ID,
                 audio=FSInputFile(
-                    audio_path,
+                    path,
                     filename=build_audio_filename(track.title),
                 ),
                 title=track.title,
                 performer=track.artist or None,
-                audio_path=audio_path,
+                audio_path=path,
                 bot_avatar=audio_thumbnail,
                 bot_url=bot_url,
                 duration=track.duration_seconds,
                 embed_thumbnail=False,
             )
 
-            db_file_id = sent.audio.file_id
-            await db.add_file(cache_key, db_file_id, "audio")
-        else:
-            await _edit_inline_status(bm.uploading_status())
+        result = await run_audio_flow(
+            cache_key=cache_key,
+            db_service=db,
+            send_cached=_send_cached,
+            download_audio=_download_audio,
+            on_missing_audio=_on_missing_audio,
+            max_file_size=MAX_FILE_SIZE,
+            on_too_large=_on_too_large,
+            prepare_metadata=_prepare_metadata,
+            send_downloaded=_send_downloaded,
+            cleanup_path=remove_file,
+        )
+        if result is None:
+            return
 
         edited = await safe_edit_inline_media(
             bot,
             inline_message_id,
             types.InputMediaAudio(
-                media=db_file_id,
+                media=result.file_id,
                 caption=bm.captions(request.user_settings["captions"], None, bot_url),
                 performer=track.artist or build_bot_audio_performer(bot_url),
                 duration=coerce_audio_duration_seconds(track.duration_seconds),
@@ -488,56 +511,19 @@ async def _send_inline_soundcloud_audio(
     except Exception:
         reset_inline_video_request(token)
         await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
-    finally:
-        if prepared_metadata:
-            prepared_metadata.cleanup()
-        if audio_path:
-            await remove_file(audio_path)
 
 
-@router.chosen_inline_result(F.result_id.startswith("soundcloud_inline:"))
-@with_chosen_inline_logging("soundcloud", "chosen_inline")
-async def chosen_inline_soundcloud_result(result: types.ChosenInlineResult):
-    if not result.inline_message_id:
-        logging.warning("Chosen inline SoundCloud result is missing inline_message_id")
-        return
-
-    token = result.result_id.removeprefix("soundcloud_inline:")
-    await _send_inline_soundcloud_audio(
-        token=token,
-        inline_message_id=result.inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+chosen_inline_soundcloud_result, send_inline_soundcloud_audio_callback = (
+    register_inline_send_handlers(
+        router,
+        service="soundcloud",
+        result_prefix="soundcloud_inline:",
+        callback_prefix="inline:soundcloud:",
+        send_fn=_send_inline_soundcloud_audio,
+        missing_inline_message_warning=(
+            "Chosen inline SoundCloud result is missing inline_message_id"
+        ),
+        chosen_handler_name="chosen_inline_soundcloud_result",
+        callback_handler_name="send_inline_soundcloud_audio_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:soundcloud:"))
-@with_callback_logging("soundcloud", "inline_callback")
-async def send_inline_soundcloud_audio_callback(call: types.CallbackQuery):
-    if not call.inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    token = call.data.removeprefix("inline:soundcloud:")
-    await call.answer()
-    try:
-        await _send_inline_soundcloud_audio(
-            token=token,
-            inline_message_id=call.inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-        return
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-            return
-        if str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
-            return
+)

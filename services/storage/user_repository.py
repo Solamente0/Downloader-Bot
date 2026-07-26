@@ -13,19 +13,10 @@ logging = logging.bind(service="db_users")
 
 
 class UserRepositoryMixin:
-    async def add_user(self, user_id: int, user_name: str | None, user_username: str | None, chat_type: str | None, language: str | None, status: str | None) -> None:
-        async with self.SessionLocal() as session:
-            async with session.begin():
-                user = User(
-                    user_id=user_id,
-                    user_name=user_name,
-                    user_username=user_username,
-                    chat_type=chat_type,
-                    language=language,
-                    status=status,
-                )
-                session.add(user)
-        self._status_cache[int(user_id)] = (time.monotonic(), status)
+    def _insert(self, model):
+        if self._dialect_name == "postgresql":
+            return pg_insert(model)
+        return sqlite_insert(model)
 
     async def upsert_chat(self, user_id: int, user_name: str | None, user_username: str | None, chat_type: str | None, language: str | None = None, status: str = "active", referred_by: int | None = None, source: str | None = None) -> None:
         values = {
@@ -41,36 +32,12 @@ class UserRepositoryMixin:
             values["source"] = source
         async with self.SessionLocal() as session:
             async with session.begin():
-                if self._dialect_name == "postgresql":
-                    stmt = (
-                        pg_insert(User)
-                        .values(user_id=user_id, **values)
-                        .on_conflict_do_update(index_elements=[User.user_id], set_=values)
-                    )
-                    await session.execute(stmt)
-                elif self._dialect_name == "sqlite":
-                    stmt = (
-                        sqlite_insert(User)
-                        .values(user_id=user_id, **values)
-                        .on_conflict_do_update(index_elements=[User.user_id], set_=values)
-                    )
-                    await session.execute(stmt)
-                else:
-                    existing = await session.execute(select(User).where(User.user_id == user_id))
-                    record = existing.scalar_one_or_none()
-                    if record:
-                        await session.execute(update(User).where(User.user_id == user_id).values(**values))
-                    else:
-                        session.add(
-                            User(
-                                user_id=user_id,
-                                user_name=user_name,
-                                user_username=user_username,
-                                chat_type=chat_type,
-                                language=language,
-                                status=status,
-                            )
-                        )
+                stmt = (
+                    self._insert(User)
+                    .values(user_id=user_id, **values)
+                    .on_conflict_do_update(index_elements=[User.user_id], set_=values)
+                )
+                await session.execute(stmt)
         self._status_cache[int(user_id)] = (time.monotonic(), status)
 
     async def delete_user(self, user_id: int) -> None:
@@ -81,33 +48,6 @@ class UserRepositoryMixin:
         user_id_int = int(user_id)
         self._status_cache.pop(user_id_int, None)
         self._settings_cache.pop(user_id_int, None)
-
-    async def user_count(self) -> int:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(func.count(User.user_id)))
-            return result.scalar() or 0
-
-    async def active_user_count(self) -> int:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(func.count(User.user_id)).where(User.status == "active"))
-            return result.scalar() or 0
-
-    async def inactive_user_count(self) -> int:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(func.count(User.user_id)).where(User.status != "active"))
-            return result.scalar() or 0
-
-    async def private_chat_count(self) -> int:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(func.count(User.user_id)).where(User.chat_type == "private"))
-            return result.scalar() or 0
-
-    async def group_chat_count(self) -> int:
-        async with self.SessionLocal() as session:
-            result = await session.execute(
-                select(func.count(User.user_id)).where(User.chat_type != "private", User.chat_type.isnot(None))
-            )
-            return result.scalar() or 0
 
     async def get_user_counts(self) -> dict[str, int]:
         async with self.SessionLocal() as session:
@@ -131,39 +71,9 @@ class UserRepositoryMixin:
                 "group_chat_count": row.group_chat_count,
             }
 
-    async def all_users(self) -> list[int]:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(User.user_id))
-            return result.scalars().all()
-
-    async def user_exist(self, user_id: int) -> bool:
-        async with self.SessionLocal() as session:
-            result = await session.execute(select(User).where(User.user_id == user_id))
-            return result.scalar() is not None
-
-    async def user_update_name(self, user_id: int, user_name: str | None, user_username: str | None) -> None:
-        async with self.SessionLocal() as session:
-            async with session.begin():
-                await session.execute(
-                    update(User)
-                    .where(User.user_id == user_id)
-                    .values(user_name=user_name, user_username=user_username)
-                )
-
     async def get_user_setting(self, user_id: int, field: str) -> str | None:
         settings = await self.user_settings(user_id)
         return settings.get(field)
-
-    async def get_referral_stats(self, user_id: int) -> int:
-        async with self.SessionLocal() as session:
-            try:
-                result = await session.execute(
-                    select(func.count(User.user_id)).where(User.referred_by == int(user_id))
-                )
-                return result.scalar() or 0
-            except Exception as exc:
-                logging.error("Error in get_referral_stats: %s", exc)
-                return 0
 
     async def user_settings(self, user_id: int) -> dict[str, str]:
         user_id_int = int(user_id)
@@ -223,38 +133,15 @@ class UserRepositoryMixin:
         async with self.SessionLocal() as session:
             async with session.begin():
                 values = {"user_id": user_id_int, field: normalized_value}
-                if self._dialect_name == "postgresql":
-                    stmt = (
-                        pg_insert(Settings)
-                        .values(**values)
-                        .on_conflict_do_update(
-                            index_elements=[Settings.user_id],
-                            set_={field: normalized_value},
-                        )
+                stmt = (
+                    self._insert(Settings)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=[Settings.user_id],
+                        set_={field: normalized_value},
                     )
-                    await session.execute(stmt)
-                elif self._dialect_name == "sqlite":
-                    stmt = (
-                        sqlite_insert(Settings)
-                        .values(**values)
-                        .on_conflict_do_update(
-                            index_elements=[Settings.user_id],
-                            set_={field: normalized_value},
-                        )
-                    )
-                    await session.execute(stmt)
-                else:
-                    existing = await session.execute(
-                        select(Settings).where(Settings.user_id == user_id_int).order_by(Settings.id.desc())
-                    )
-                    setting_rows = existing.scalars().all()
-                    setting = setting_rows[0] if setting_rows else None
-                    if setting is None:
-                        setting = Settings(user_id=user_id_int)
-                        session.add(setting)
-                    setattr(setting, field, normalized_value)
-                    for duplicate in setting_rows[1:]:
-                        await session.delete(duplicate)
+                )
+                await session.execute(stmt)
         self._settings_cache.pop(user_id_int, None)
         updated = await self.user_settings(user_id_int)
         updated[field] = normalized_value
@@ -292,13 +179,6 @@ class UserRepositoryMixin:
         async with self.SessionLocal() as session:
             result = await session.execute(
                 select(User.user_name, User.user_username, User.status).where(User.user_id == user_id)
-            )
-            return result.first()
-
-    async def get_user_info_username(self, user_username: str) -> Any:
-        async with self.SessionLocal() as session:
-            result = await session.execute(
-                select(User.user_name, User.user_id, User.status).where(User.user_username == user_username)
             )
             return result.first()
 

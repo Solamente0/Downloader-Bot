@@ -4,17 +4,14 @@ import json
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Awaitable, Callable, Iterator, Optional
+from typing import Any, Awaitable, Callable, Iterator
 from urllib.parse import urlparse
 
 from services.logger import logger as logging
+from services.platforms import CobaltMediaService
 from utils.download_manager import (
-    DownloadConfig,
-    DownloadError,
+    DownloadError as DownloadError,  # noqa: F401  (re-exported for handlers)
     DownloadMetrics,
-    DownloadQueueBusyError,
-    DownloadRateLimitError,
-    ResilientDownloader,
 )
 from utils.http_client import get_http_session
 
@@ -100,13 +97,15 @@ class _JsonScriptParser(HTMLParser):
             self._body = None
 
 
-def _iter_json_blobs(page: str) -> Iterator[dict[str, Any]]:
+def _iter_json_blobs(page: str, *, contains: str | None = None) -> Iterator[dict[str, Any]]:
     parser = _JsonScriptParser()
     parser.feed(page)
     for attrs, body in parser.scripts:
         if attrs.get("type") != "application/json" or "data-sjs" not in attrs:
             continue
         if not body.lstrip().startswith("{"):
+            continue
+        if contains is not None and contains not in body:
             continue
         try:
             payload = json.loads(body)
@@ -128,13 +127,14 @@ def _walk_json(value: Any) -> Iterator[dict[str, Any]]:
 
 def _find_post(page: str, post_code: str) -> dict[str, Any] | None:
     needle = f'"code":"{post_code}"'
-    for payload in _iter_json_blobs(page):
-        serialized = json.dumps(payload, separators=(",", ":"))
-        if needle not in serialized:
-            continue
-        for node in _walk_json(payload):
-            if node.get("code") == post_code:
-                return node
+    # Threads blobs are minified, so the needle usually matches the raw script
+    # text; pre-filter on it to avoid parsing unrelated blobs, then fall back
+    # to parsing every blob in case the raw-text match missed.
+    for contains in (needle, None):
+        for payload in _iter_json_blobs(page, contains=contains):
+            for node in _walk_json(payload):
+                if node.get("code") == post_code:
+                    return node
     return None
 
 
@@ -233,7 +233,7 @@ async def fetch_threads_post_html(url: str) -> str:
         return await response.text()
 
 
-class ThreadsMediaService:
+class ThreadsMediaService(CobaltMediaService):
     def __init__(
         self,
         output_dir: str,
@@ -241,18 +241,15 @@ class ThreadsMediaService:
         fetch_page_func: Callable[[str], Awaitable[str]] = fetch_threads_post_html,
         retry_async_operation_func: Callable[..., Awaitable[DownloadMetrics | None]],
     ) -> None:
-        self._fetch_page = fetch_page_func
-        self._retry_async_operation = retry_async_operation_func
-        self._downloader = ResilientDownloader(
+        super().__init__(
             output_dir,
-            config=DownloadConfig(
-                chunk_size=1024 * 1024,
-                multipart_threshold=16 * 1024 * 1024,
-                max_workers=6,
-                retry_backoff=0.8,
-            ),
             source="threads",
+            retry_async_operation_func=retry_async_operation_func,
+            logger=logging,
+            download_error_message="Threads media download failed: url=%s error=%s",
+            download_headers=THREADS_MEDIA_HEADERS,
         )
+        self._fetch_page = fetch_page_func
 
     async def fetch_post(self, url: str) -> ThreadsPost | None:
         source_url = strip_threads_url(url)
@@ -270,42 +267,3 @@ class ThreadsMediaService:
         if not post:
             logging.warning("Threads post has no extractable content: post=%s", post_code)
         return post
-
-    async def download_media(
-        self,
-        url: str,
-        filename: str,
-        *,
-        user_id: Optional[int] = None,
-        chat_id: Optional[int] = None,
-        request_id: Optional[str] = None,
-        size_hint: Optional[int] = None,
-        on_queued=None,
-        on_progress=None,
-        on_retry=None,
-    ) -> DownloadMetrics | None:
-        async def _download_once() -> DownloadMetrics:
-            return await self._downloader.download(
-                url,
-                filename,
-                headers=THREADS_MEDIA_HEADERS,
-                user_id=user_id,
-                chat_id=chat_id,
-                request_id=request_id,
-                size_hint=size_hint,
-                on_queued=on_queued,
-                on_progress=on_progress,
-            )
-
-        try:
-            return await self._retry_async_operation(
-                _download_once,
-                attempts=3,
-                retry_on_exception=lambda exc: not isinstance(exc, (DownloadRateLimitError, DownloadQueueBusyError)),
-                on_retry=on_retry,
-            )
-        except (DownloadRateLimitError, DownloadQueueBusyError):
-            raise
-        except DownloadError as exc:
-            logging.error("Threads media download failed: url=%s error=%s", url, exc)
-            return None

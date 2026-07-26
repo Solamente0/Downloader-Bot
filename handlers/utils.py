@@ -16,6 +16,8 @@ from handlers.inline_utils import (
     build_inline_album_result,
     build_inline_status_editor,
     build_start_deeplink_url,
+    register_inline_send_handlers,
+    run_inline_send_callback,
     safe_answer_inline_query,
     sanitize_inline_results,
 )
@@ -57,6 +59,21 @@ from handlers.telegram_ui_utils import (
     send_chat_action_if_needed,
 )
 
+def make_backpressure_handler(message, business_id):
+    """Build the shared backpressure closure used by the single-media flows:
+    forwards DownloadRateLimitError/DownloadQueueBusyError to the user-facing
+    handler, showing service status only outside business chats."""
+
+    async def _handle_backpressure(exc: Exception) -> None:
+        await handle_download_backpressure_error(
+            exc,
+            message=message,
+            show_service_status=business_id is None,
+        )
+
+    return _handle_backpressure
+
+
 __all__ = [
     "_bot_avatar_file_id",
     "_bot_avatar_path",
@@ -88,13 +105,16 @@ __all__ = [
     "load_user_settings",
     "log_context_scope",
     "log_duration",
+    "make_backpressure_handler",
     "make_retry_status_notifier",
     "make_status_text_progress_updater",
     "maybe_delete_user_message",
     "react_to_message",
+    "register_inline_send_handlers",
     "remove_file",
     "resolve_settings_target_id",
     "retry_async_operation",
+    "run_inline_send_callback",
     "safe_answer_inline_query",
     "safe_delete_message",
     "safe_edit_inline_media",

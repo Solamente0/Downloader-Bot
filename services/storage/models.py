@@ -81,9 +81,7 @@ class User(Base):
 class AnalyticsEvent(Base):
     __tablename__ = "analytics_events"
     __table_args__ = (
-        Index("ix_analytics_events_created_at", "created_at"),
         Index("ix_analytics_events_action_name_created_at", "action_name", "created_at"),
-        Index("ix_analytics_events_action_name", "action_name"),
         Index("ix_analytics_events_created_action", "created_at", "action_name"),
     )
 

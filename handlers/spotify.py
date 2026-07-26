@@ -31,6 +31,7 @@ from handlers.utils import (
 )
 from handlers.youtube import download_mp3_with_ytdlp_metrics, search_youtube_track
 from services.logger import logger as logging, summarize_url_for_log
+from services.media.audio_flow import run_audio_flow
 from services.media.audio_metadata import (
     build_audio_filename,
     prepare_mp3_metadata,
@@ -80,8 +81,6 @@ async def process_spotify(message: types.Message, direct_url: Optional[str] = No
     business_id = message.business_connection_id
     show_service_status = business_id is None
     status_message: Optional[types.Message] = None
-    audio_path: str | None = None
-    prepared_metadata = None
     request_lease = None
     try:
         if await should_skip_duplicate_business_message(
@@ -111,81 +110,102 @@ async def process_spotify(message: types.Message, direct_url: Optional[str] = No
             status_message = await message.answer(bm.downloading_audio_status())
 
         cache_key = build_audio_cache_key(source_url)
-        db_file_id = await db.get_file_id(cache_key)
-        if db_file_id:
+        track: dict | None = None
+        youtube_track: dict | None = None
+
+        async def _send_cached(file_id: str):
             await safe_edit_text(status_message, bm.uploading_status())
             await send_chat_action_if_needed(
                 bot, message.chat.id, "upload_audio", business_id
             )
-            await message.reply_audio(
-                audio=db_file_id,
+            return await message.reply_audio(
+                audio=file_id,
                 caption=bm.captions(user_settings["captions"], None, bot_url),
                 parse_mode="HTML",
             )
+
+        async def _fetch_track() -> bool:
+            nonlocal track, youtube_track
+            track = await get_spotify_track(source_url)
+            query = " - ".join(
+                value
+                for value in (track.get("artists"), track.get("title"))
+                if value and value != "Unknown artist"
+            )
+            youtube_track = await asyncio.to_thread(search_youtube_track, query)
+            if not youtube_track or not youtube_track.get("webpage_url"):
+                await message.reply(bm.spotify_source_not_found())
+                return False
+            return True
+
+        async def _download_audio():
+            base_name = f"{track['spotify_id']}_spotify_audio"
+            return await retry_async_operation(
+                lambda: download_mp3_with_ytdlp_metrics(
+                    youtube_track["webpage_url"],
+                    base_name,
+                    "spotify_audio_mp3",
+                    max_filesize=MAX_FILE_SIZE - 1,
+                ),
+                attempts=3,
+                delay_seconds=2.0,
+                should_retry_result=lambda result: result is None,
+            )
+
+        async def _prepare_metadata(path: str):
+            return await prepare_mp3_metadata(path, track)
+
+        async def _send_downloaded(path: str, prepared_metadata):
+            await safe_edit_text(status_message, bm.uploading_status())
+            await send_chat_action_if_needed(
+                bot, message.chat.id, "upload_audio", business_id
+            )
+            thumbnail = (
+                FSInputFile(str(prepared_metadata.thumbnail_path), filename="cover.jpg")
+                if prepared_metadata.thumbnail_path
+                else await get_bot_avatar_thumbnail(bot)
+            )
+            return await send_audio_with_thumbnail(
+                message.reply_audio,
+                audio=FSInputFile(
+                    path,
+                    filename=build_audio_filename(track.get("title")),
+                ),
+                title=track.get("title"),
+                performer=track.get("artists"),
+                caption=bm.captions(user_settings["captions"], None, bot_url),
+                audio_path=path,
+                bot_avatar=thumbnail,
+                bot_url=bot_url,
+                duration=track.get("duration"),
+                embed_thumbnail=False,
+                parse_mode="HTML",
+            )
+
+        async def _after_send(_result):
             await maybe_delete_user_message(message, user_settings["delete_message"])
             request_lease.mark_success()
-            return
 
-        track = await get_spotify_track(source_url)
-        query = " - ".join(
-            value
-            for value in (track.get("artists"), track.get("title"))
-            if value and value != "Unknown artist"
-        )
-        youtube_track = await asyncio.to_thread(search_youtube_track, query)
-        if not youtube_track or not youtube_track.get("webpage_url"):
-            await message.reply(bm.spotify_source_not_found())
-            return
-
-        base_name = f"{track['spotify_id']}_spotify_audio"
-        metrics = await retry_async_operation(
-            lambda: download_mp3_with_ytdlp_metrics(
-                youtube_track["webpage_url"],
-                base_name,
-                "spotify_audio_mp3",
-                max_filesize=MAX_FILE_SIZE - 1,
-            ),
-            attempts=3,
-            delay_seconds=2.0,
-            should_retry_result=lambda result: result is None,
-        )
-        if not metrics:
+        async def _on_missing_audio():
             await handle_download_error(message, business_id=business_id)
-            return
-        audio_path = metrics.path
-        if metrics.size >= MAX_FILE_SIZE:
-            await message.reply(bm.audio_too_large())
-            return
 
-        prepared_metadata = await prepare_mp3_metadata(audio_path, track)
-        await safe_edit_text(status_message, bm.uploading_status())
-        await send_chat_action_if_needed(
-            bot, message.chat.id, "upload_audio", business_id
+        async def _on_too_large():
+            await message.reply(bm.audio_too_large())
+
+        await run_audio_flow(
+            cache_key=cache_key,
+            db_service=db,
+            send_cached=_send_cached,
+            fetch_metadata=_fetch_track,
+            download_audio=_download_audio,
+            on_missing_audio=_on_missing_audio,
+            max_file_size=MAX_FILE_SIZE,
+            on_too_large=_on_too_large,
+            prepare_metadata=_prepare_metadata,
+            send_downloaded=_send_downloaded,
+            cleanup_path=remove_file,
+            on_after_send=_after_send,
         )
-        thumbnail = (
-            FSInputFile(str(prepared_metadata.thumbnail_path), filename="cover.jpg")
-            if prepared_metadata.thumbnail_path
-            else await get_bot_avatar_thumbnail(bot)
-        )
-        sent = await send_audio_with_thumbnail(
-            message.reply_audio,
-            audio=FSInputFile(
-                audio_path,
-                filename=build_audio_filename(track.get("title")),
-            ),
-            title=track.get("title"),
-            performer=track.get("artists"),
-            caption=bm.captions(user_settings["captions"], None, bot_url),
-            audio_path=audio_path,
-            bot_avatar=thumbnail,
-            bot_url=bot_url,
-            duration=track.get("duration"),
-            embed_thumbnail=False,
-            parse_mode="HTML",
-        )
-        await db.add_file(cache_key, sent.audio.file_id, "audio")
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-        request_lease.mark_success()
     except SpotifyError as exc:
         logging.warning("Spotify metadata error: url=%s error=%s", source_url, exc)
         await message.reply(bm.spotify_metadata_failed())
@@ -207,10 +227,6 @@ async def process_spotify(message: types.Message, direct_url: Optional[str] = No
         if request_lease is not None:
             request_lease.finish()
         await safe_delete_message(status_message)
-        if audio_path:
-            await remove_file(audio_path)
-        if prepared_metadata:
-            prepared_metadata.cleanup()
         await update_info(message)
 
 

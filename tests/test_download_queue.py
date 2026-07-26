@@ -245,6 +245,89 @@ async def test_queue_per_user_slot_race():
 
 
 @pytest.mark.asyncio
+async def test_queue_prunes_idle_scope_state():
+    queue = AdaptiveDownloadQueue(
+        min_workers=1,
+        max_workers=1,
+        per_user_rate_limit=20,
+        per_user_window_seconds=0.05,
+    )
+
+    async def job():
+        return "ok"
+
+    await queue.submit(job, priority=20, source="test", user_id=7, chat_id=123)
+    scope_key = queue._build_scope_key(7, 123)
+    assert scope_key in queue._user_recent
+    assert scope_key in queue._user_slots
+    assert scope_key in queue._user_submit_locks
+
+    await asyncio.sleep(0.06)
+    queue._prune_idle_scopes()
+
+    assert scope_key not in queue._user_recent
+    assert scope_key not in queue._user_slots
+    assert scope_key not in queue._user_submit_locks
+    await queue.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queue_prune_keeps_scope_with_pending_job():
+    queue = AdaptiveDownloadQueue(
+        min_workers=1,
+        max_workers=1,
+        per_user_rate_limit=20,
+        per_user_window_seconds=0.05,
+    )
+    blocker = asyncio.Event()
+
+    async def hold():
+        await blocker.wait()
+        return "ok"
+
+    task = asyncio.create_task(queue.submit(hold, priority=20, source="test", user_id=8))
+    await asyncio.sleep(0.06)
+    queue._prune_idle_scopes()
+
+    scope_key = queue._build_scope_key(8, None)
+    assert scope_key in queue._user_slots
+    assert scope_key in queue._user_submit_locks
+
+    blocker.set()
+    assert await task == "ok"
+    await queue.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queue_autotune_triggers_scope_prune():
+    from services.download.queue import _SCOPE_PRUNE_INTERVAL_SECONDS
+
+    queue = AdaptiveDownloadQueue(
+        min_workers=1,
+        max_workers=1,
+        per_user_rate_limit=20,
+        per_user_window_seconds=0.05,
+    )
+
+    async def job():
+        return "ok"
+
+    await queue.submit(job, priority=20, source="test", user_id=9)
+    scope_key = queue._build_scope_key(9, None)
+    await asyncio.sleep(0.06)
+
+    queue._last_scope_prune -= _SCOPE_PRUNE_INTERVAL_SECONDS + 1.0
+    before = queue._last_scope_prune
+    await queue._maybe_autotune()
+
+    assert queue._last_scope_prune > before
+    assert scope_key not in queue._user_recent
+    assert scope_key not in queue._user_slots
+    assert scope_key not in queue._user_submit_locks
+    await queue.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_request_dedupe_concurrent_same_key():
     from services.runtime.request_dedupe import claim_request, finish_request, reset_request_tracking
 

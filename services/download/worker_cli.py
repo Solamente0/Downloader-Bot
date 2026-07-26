@@ -4,6 +4,7 @@ import json
 import sys
 from dataclasses import asdict
 
+from services.logger import disable_log_sinks
 from utils.download_manager import DownloadConfig, ResilientDownloader
 
 
@@ -23,6 +24,11 @@ def _build_config(raw: dict) -> DownloadConfig:
 
 
 def main() -> int:
+    # The parent process raises this worker's entire stderr as the download
+    # error message and shares its log files, so drop every log sink first:
+    # stderr must carry only the final exception text, and a second process
+    # must not write/rotate the parent's rotating log files.
+    disable_log_sinks()
     try:
         payload = _read_payload()
         config = _build_config(payload.get("config") or {})

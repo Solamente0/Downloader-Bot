@@ -4,7 +4,6 @@ import re
 from typing import Optional
 
 from aiogram import types, Router, F
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
 
 import keyboards as kb
@@ -30,6 +29,7 @@ from handlers.utils import (
     handle_download_backpressure_error,
     handle_download_error,
     load_user_settings,
+    make_backpressure_handler,
     make_retry_status_notifier,
     make_status_text_progress_updater,
     maybe_delete_user_message,
@@ -43,8 +43,7 @@ from handlers.utils import (
     send_chat_action_if_needed,
     should_skip_duplicate_business_message,
     retry_async_operation,
-    with_callback_logging,
-    with_chosen_inline_logging,
+    register_inline_send_handlers,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
@@ -57,11 +56,11 @@ from services.logger import (
 from app_context import bot, db, send_analytics
 from services.media.delivery import (
     build_audio_cache_key,
+    make_video_or_document_senders,
     send_audio_with_thumbnail,
     send_cached_media_entries,
 )
 from services.media.orchestration import run_single_media_flow
-from services.media.video_metadata import build_video_send_kwargs
 from services.media.resolver import resolve_cached_media_items
 from services.platforms.instagram_media import (
     InstagramMedia,
@@ -251,33 +250,14 @@ async def process_instagram_video(
             audio_callback_data=audio_callback_data,
         )
 
-    async def _send_cached(file_id: str):
-        logging.info(
-            "Serving cached Instagram video: url=%s file_id=%s",
-            summarize_url_for_log(db_video_url),
-            file_id,
-        )
-        try:
-            if as_document:
-                return await message.reply_document(
-                    document=file_id,
-                    caption=bm.captions(
-                        user_settings["captions"], data.description, bot_url
-                    ),
-                    reply_markup=_reply_markup(),
-                    parse_mode="HTML",
-                    disable_content_type_detection=True,
-                )
-            return await message.reply_video(
-                video=file_id,
-                caption=bm.captions(
-                    user_settings["captions"], data.description, bot_url
-                ),
-                reply_markup=_reply_markup(),
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            return None
+    _send_cached, _send_downloaded, _extract_file_id = make_video_or_document_senders(
+        message,
+        caption=bm.captions(user_settings["captions"], data.description, bot_url),
+        reply_markup_fn=_reply_markup,
+        as_document=as_document,
+        cached_log_label="Instagram video",
+        cached_log_url=db_video_url,
+    )
 
     async def _download_media():
         return await asyncio.wait_for(
@@ -290,23 +270,6 @@ async def process_instagram_video(
                 on_retry=on_retry,
             ),
             timeout=420.0,
-        )
-
-    async def _send_downloaded(path: str):
-        if as_document:
-            return await message.reply_document(
-                document=FSInputFile(path),
-                caption=bm.captions(user_settings["captions"], data.description, bot_url),
-                reply_markup=_reply_markup(),
-                parse_mode="HTML",
-                disable_content_type_detection=True,
-            )
-        return await message.reply_video(
-            video=FSInputFile(path),
-            caption=bm.captions(user_settings["captions"], data.description, bot_url),
-            reply_markup=_reply_markup(),
-            parse_mode="HTML",
-            **(await build_video_send_kwargs(path)),
         )
 
     async def _after_send():
@@ -324,12 +287,7 @@ async def process_instagram_video(
             return False
         return True
 
-    async def _handle_backpressure(exc: Exception) -> None:
-        await handle_download_backpressure_error(
-            exc,
-            message=message,
-            show_service_status=business_id is None,
-        )
+    _handle_backpressure = make_backpressure_handler(message, business_id)
 
     async def _handle_cache_store_error(exc: Exception) -> None:
         logging.error(
@@ -359,9 +317,7 @@ async def process_instagram_video(
         send_cached=_send_cached,
         download_media=_download_media,
         send_downloaded=_send_downloaded,
-        extract_file_id=lambda sent: (
-            sent.document.file_id if getattr(sent, "document", None) else (sent.video.file_id if getattr(sent, "video", None) else None)
-        ),
+        extract_file_id=_extract_file_id,
         cleanup_path=remove_file,
         delete_status_message=lambda: safe_delete_message(status_message),
         on_missing_media=lambda: handle_download_error(
@@ -660,49 +616,17 @@ async def _send_inline_instagram_video(
     )
 
 
-@router.chosen_inline_result(F.result_id.startswith("instagram_inline:"))
-@with_chosen_inline_logging("instagram", "chosen_inline")
-async def chosen_inline_instagram_result(result: types.ChosenInlineResult):
-    if not result.inline_message_id:
-        logging.warning("Chosen inline Instagram result is missing inline_message_id")
-        return
-
-    token = result.result_id.removeprefix("instagram_inline:")
-    await _send_inline_instagram_video(
-        token=token,
-        inline_message_id=result.inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+chosen_inline_instagram_result, send_inline_instagram_video_callback = (
+    register_inline_send_handlers(
+        router,
+        service="instagram",
+        result_prefix="instagram_inline:",
+        callback_prefix="inline:instagram:",
+        send_fn=_send_inline_instagram_video,
+        missing_inline_message_warning=(
+            "Chosen inline Instagram result is missing inline_message_id"
+        ),
+        chosen_handler_name="chosen_inline_instagram_result",
+        callback_handler_name="send_inline_instagram_video_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:instagram:"))
-@with_callback_logging("instagram", "inline_callback")
-async def send_inline_instagram_video_callback(call: types.CallbackQuery):
-    if not call.inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    token = call.data.removeprefix("inline:instagram:")
-    await call.answer()
-    try:
-        await _send_inline_instagram_video(
-            token=token,
-            inline_message_id=call.inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-        return
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-            return
-        if str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
-            return
+)

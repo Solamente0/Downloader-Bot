@@ -27,6 +27,7 @@ from handlers.utils import (
     maybe_delete_user_message,
     react_to_message,
     remove_file,
+    register_inline_send_handlers,
     retry_async_operation,
     safe_delete_message,
     safe_answer_inline_query,
@@ -35,16 +36,17 @@ from handlers.utils import (
     safe_edit_text,
     send_chat_action_if_needed,
     should_skip_duplicate_business_message,
-    with_callback_logging,
-    with_chosen_inline_logging,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
 )
 from services.logger import logger as logging, summarize_text_for_log, summarize_url_for_log
 from services.media.delivery import send_cached_media_entries
-from services.media.orchestration import handle_download_backpressure, run_single_media_flow
-from services.media.resolver import resolve_cached_media_items
+from services.media.orchestration import (
+    make_message_backpressure_handler,
+    run_media_group_flow,
+    run_single_media_flow,
+)
 from services.media.video_metadata import build_video_send_kwargs
 from services.platforms.threads_media import (
     DownloadError,
@@ -243,14 +245,13 @@ async def process_threads_single_media(
             return False
         return True
 
-    async def _handle_backpressure(exc: Exception) -> None:
-        await handle_download_backpressure(
-            exc,
-            business_id=business_id,
-            on_rate_limit_reply=lambda retry_after: message.reply(build_rate_limit_text(retry_after)),
-            on_queue_busy_reply=lambda position: message.reply(build_queue_busy_text(position)),
-            on_business_error=lambda: handle_download_error(message, business_id=business_id),
-        )
+    _handle_backpressure = make_message_backpressure_handler(
+        message,
+        business_id,
+        build_rate_limit_text=build_rate_limit_text,
+        build_queue_busy_text=build_queue_busy_text,
+        handle_download_error=handle_download_error,
+    )
 
     sent = await run_single_media_flow(
         cache_key=cache_key,
@@ -303,23 +304,7 @@ async def process_threads_media_group(
             request_id=request_id,
         )
 
-    media_items, downloaded_paths = await resolve_cached_media_items(
-        post.media_list,
-        db_service=db,
-        kind_getter=lambda item: item.type,
-        build_cache_key=lambda index, _item, media_kind: build_media_cache_key(
-            source_url, item_index=index, item_kind=media_kind
-        ),
-        download_item=_download_item,
-        metrics_label="threads_group",
-        error_label="Threads",
-    )
-    if not media_items:
-        await handle_download_error(message, business_id=business_id)
-        return False
-
-    try:
-        await safe_edit_text(status_message, bm.uploading_status())
+    async def _send_entries(media_items: list[dict]) -> None:
         await send_cached_media_entries(
             message,
             media_items,
@@ -329,12 +314,25 @@ async def process_threads_media_group(
             parse_mode="HTML",
             kind_key="type",
         )
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-        return True
-    finally:
-        await safe_delete_message(status_message)
-        for path in downloaded_paths:
-            await remove_file(path)
+
+    return await run_media_group_flow(
+        media_list=post.media_list,
+        db_service=db,
+        kind_getter=lambda item: item.type,
+        build_cache_key=lambda index, _item, media_kind: build_media_cache_key(
+            source_url, item_index=index, item_kind=media_kind
+        ),
+        download_item=_download_item,
+        metrics_label="threads_group",
+        error_label="Threads",
+        update_status=lambda text: safe_edit_text(status_message, text),
+        upload_status_text=bm.uploading_status(),
+        send_entries=_send_entries,
+        on_empty=lambda: handle_download_error(message, business_id=business_id),
+        delete_status_message=lambda: safe_delete_message(status_message),
+        cleanup_path=remove_file,
+        on_after_send=lambda: maybe_delete_user_message(message, user_settings["delete_message"]),
+    )
 
 
 @router.inline_query(F.query.regexp(THREADS_URL_REGEX, mode="search"))
@@ -388,46 +386,17 @@ async def _send_inline_threads_media(
     )
 
 
-@router.chosen_inline_result(F.result_id.startswith("threads_inline:"))
-@with_chosen_inline_logging("threads", "chosen_inline")
-async def chosen_inline_threads_result(result: types.ChosenInlineResult) -> None:
-    if not result.inline_message_id:
-        logging.warning("Chosen inline Threads result is missing inline_message_id")
-        return
-
-    token = result.result_id.removeprefix("threads_inline:")
-    await _send_inline_threads_media(
-        token=token,
-        inline_message_id=result.inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+chosen_inline_threads_result, send_inline_threads_media_callback = (
+    register_inline_send_handlers(
+        router,
+        service="threads",
+        result_prefix="threads_inline:",
+        callback_prefix="inline:threads:",
+        send_fn=_send_inline_threads_media,
+        missing_inline_message_warning=(
+            "Chosen inline Threads result is missing inline_message_id"
+        ),
+        chosen_handler_name="chosen_inline_threads_result",
+        callback_handler_name="send_inline_threads_media_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:threads:"))
-@with_callback_logging("threads", "inline_callback")
-async def send_inline_threads_media_callback(call: types.CallbackQuery) -> None:
-    if not call.inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    token = call.data.removeprefix("inline:threads:")
-    await call.answer()
-    try:
-        await _send_inline_threads_media(
-            token=token,
-            inline_message_id=call.inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-        elif str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
+)

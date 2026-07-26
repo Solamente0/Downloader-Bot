@@ -15,8 +15,11 @@ from handlers.pinterest_inline import handle_pinterest_inline_query, send_inline
 from handlers.request_dedupe import claim_message_request
 from services.media.delivery import send_cached_media_entries
 from services.media.video_metadata import build_video_send_kwargs
-from services.media.orchestration import handle_download_backpressure, run_single_media_flow
-from services.media.resolver import resolve_cached_media_items
+from services.media.orchestration import (
+    make_message_backpressure_handler,
+    run_media_group_flow,
+    run_single_media_flow,
+)
 from services.platforms.pinterest_media import (
     PinterestMedia,
     PinterestMediaService,
@@ -38,6 +41,7 @@ from handlers.utils import (
     maybe_delete_user_message,
     react_to_message,
     remove_file,
+    register_inline_send_handlers,
     retry_async_operation,
     safe_delete_message,
     safe_edit_text,
@@ -46,8 +50,6 @@ from handlers.utils import (
     safe_answer_inline_query,
     send_chat_action_if_needed,
     should_skip_duplicate_business_message,
-    with_callback_logging,
-    with_chosen_inline_logging,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
@@ -127,12 +129,10 @@ async def process_pinterest(message: types.Message, direct_url: Optional[str] = 
             return
 
         first = post.media_list[0]
-        if len(post.media_list) == 1 and first.type == "video":
-            if await process_pinterest_single_video(message, post, source_url, bot_url, user_settings, business_id):
-                request_lease.mark_success()
-            return
-        if len(post.media_list) == 1 and first.type == "photo":
-            if await process_pinterest_single_photo(message, post, source_url, bot_url, user_settings, business_id):
+        if len(post.media_list) == 1 and first.type in ("video", "photo"):
+            if await process_pinterest_single_media(
+                message, post, source_url, bot_url, user_settings, business_id, first.type
+            ):
                 request_lease.mark_success()
             return
         if await process_pinterest_media_group(message, post, source_url, bot_url, user_settings, business_id):
@@ -155,29 +155,35 @@ async def process_pinterest_url(message: types.Message, url: Optional[str] = Non
     await process_pinterest(message, direct_url=url)
 
 
-async def process_pinterest_single_video(
+async def process_pinterest_single_media(
     message: types.Message,
     post: PinterestPost,
     source_url: str,
     bot_url: str,
     user_settings: dict,
     business_id: Optional[int],
+    media_kind: str,
 ):
     media = post.media_list[0]
     status_message: Optional[types.Message] = None
     if business_id is None:
         status_message = await message.answer(bm.downloading_video_status())
+
+    extension = "mp4"
+    if media_kind == "photo":
+        extension = "jpg"
+        low_url = media.url.lower().split("?", 1)[0]
+        if low_url.endswith(".png"):
+            extension = "png"
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    download_name = f"{post.id}_{timestamp}_pinterest_video.mp4"
+    filename = f"{post.id}_{timestamp}_pinterest_{media_kind}.{extension}"
+    cache_key = source_url if media_kind == "video" else f"{source_url}#photo"
 
     async def _edit_status(text: str) -> None:
         await safe_edit_text(status_message, text)
 
-    on_progress = make_status_text_progress_updater("Pinterest video", _edit_status)
-    on_retry = make_retry_status_notifier(
-        _edit_status,
-        enabled=business_id is None,
-    )
+    on_progress = make_status_text_progress_updater(f"Pinterest {media_kind}", _edit_status)
+    on_retry = make_retry_status_notifier(_edit_status, enabled=business_id is None)
 
     def _reply_markup():
         return kb.return_video_info_keyboard(
@@ -186,111 +192,18 @@ async def process_pinterest_single_video(
         )
 
     async def _download_media():
-        return await asyncio.wait_for(
-            pinterest_service.download_media(
-                media.url,
-                download_name,
-                user_id=message.from_user.id,
-                chat_id=message.chat.id,
-                on_progress=on_progress,
-                on_retry=on_retry,
-            ),
-            timeout=420.0,
-        )
-
-    async def _send_cached(file_id: str):
-        try:
-            return await message.reply_video(
-                video=file_id,
-                caption=bm.captions(user_settings["captions"], post.description, bot_url),
-                reply_markup=_reply_markup(),
-                parse_mode="HTML",
+        if media_kind == "video":
+            return await asyncio.wait_for(
+                pinterest_service.download_media(
+                    media.url,
+                    filename,
+                    user_id=message.from_user.id,
+                    chat_id=message.chat.id,
+                    on_progress=on_progress,
+                    on_retry=on_retry,
+                ),
+                timeout=420.0,
             )
-        except TelegramBadRequest:
-            return None
-
-    async def _send_downloaded(path: str):
-        return await message.reply_video(
-            video=FSInputFile(path),
-            caption=bm.captions(user_settings["captions"], post.description, bot_url),
-            reply_markup=_reply_markup(),
-            parse_mode="HTML",
-            **(await build_video_send_kwargs(path)),
-        )
-
-    async def _after_send():
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-
-    async def _inspect_metrics(metrics: DownloadMetrics) -> bool:
-        log_download_metrics("pinterest_video", metrics)
-        if metrics.size >= MAX_FILE_SIZE:
-            await handle_download_error(message, business_id=business_id, text=bm.video_too_large())
-            return False
-        return True
-
-    async def _handle_backpressure(exc: Exception) -> None:
-        await handle_download_backpressure(
-            exc,
-            business_id=business_id,
-            on_rate_limit_reply=lambda retry_after: message.reply(build_rate_limit_text(retry_after)),
-            on_queue_busy_reply=lambda position: message.reply(build_queue_busy_text(position)),
-            on_business_error=lambda: handle_download_error(message, business_id=business_id),
-        )
-
-    sent_message = await run_single_media_flow(
-        cache_key=source_url,
-        cache_file_type="video",
-        db_service=db,
-        upload_status_text=bm.uploading_status(),
-        upload_action="upload_video",
-        update_status=_edit_status,
-        send_chat_action=lambda action: send_chat_action_if_needed(bot, message.chat.id, action, business_id),
-        send_cached=_send_cached,
-        download_media=_download_media,
-        send_downloaded=_send_downloaded,
-        extract_file_id=lambda sent: sent.video.file_id if getattr(sent, "video", None) else None,
-        cleanup_path=remove_file,
-        delete_status_message=lambda: safe_delete_message(status_message),
-        on_missing_media=lambda: handle_download_error(message, business_id=business_id),
-        on_after_send=_after_send,
-        inspect_metrics=_inspect_metrics,
-        on_rate_limit=_handle_backpressure,
-        on_queue_busy=_handle_backpressure,
-    )
-    return sent_message is not None
-
-
-async def process_pinterest_single_photo(
-    message: types.Message,
-    post: PinterestPost,
-    source_url: str,
-    bot_url: str,
-    user_settings: dict,
-    business_id: Optional[int],
-):
-    media = post.media_list[0]
-    cache_key = f"{source_url}#photo"
-    status_message: Optional[types.Message] = None
-    if business_id is None:
-        status_message = await message.answer(bm.downloading_video_status())
-
-    ext = "jpg"
-    low_url = media.url.lower().split("?", 1)[0]
-    if low_url.endswith(".png"):
-        ext = "png"
-    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{post.id}_{timestamp}_pinterest_photo.{ext}"
-
-    async def _edit_status(text: str) -> None:
-        await safe_edit_text(status_message, text)
-
-    def _reply_markup():
-        return kb.return_video_info_keyboard(
-            None, None, None, None, None, source_url, user_settings,
-            audio_callback_data=None,
-        )
-
-    async def _download_media():
         return await pinterest_service.download_media(
             media.url,
             filename,
@@ -301,6 +214,13 @@ async def process_pinterest_single_photo(
 
     async def _send_cached(file_id: str):
         try:
+            if media_kind == "video":
+                return await message.reply_video(
+                    video=file_id,
+                    caption=bm.captions(user_settings["captions"], post.description, bot_url),
+                    reply_markup=_reply_markup(),
+                    parse_mode="HTML",
+                )
             return await message.reply_photo(
                 photo=file_id,
                 caption=bm.captions(user_settings["captions"], post.description, bot_url),
@@ -311,6 +231,14 @@ async def process_pinterest_single_photo(
             return None
 
     async def _send_downloaded(path: str):
+        if media_kind == "video":
+            return await message.reply_video(
+                video=FSInputFile(path),
+                caption=bm.captions(user_settings["captions"], post.description, bot_url),
+                reply_markup=_reply_markup(),
+                parse_mode="HTML",
+                **(await build_video_send_kwargs(path)),
+            )
         return await message.reply_photo(
             photo=FSInputFile(path),
             caption=bm.captions(user_settings["captions"], post.description, bot_url),
@@ -318,32 +246,76 @@ async def process_pinterest_single_photo(
             parse_mode="HTML",
         )
 
-    async def _after_send():
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-
     async def _inspect_metrics(metrics: DownloadMetrics) -> bool:
-        log_download_metrics("pinterest_photo", metrics)
+        log_download_metrics(f"pinterest_{media_kind}", metrics)
+        if media_kind == "video" and metrics.size >= MAX_FILE_SIZE:
+            await handle_download_error(message, business_id=business_id, text=bm.video_too_large())
+            return False
         return True
+
+    _handle_backpressure = (
+        make_message_backpressure_handler(
+            message,
+            business_id,
+            build_rate_limit_text=build_rate_limit_text,
+            build_queue_busy_text=build_queue_busy_text,
+            handle_download_error=handle_download_error,
+        )
+        if media_kind == "video"
+        else None
+    )
 
     sent_message = await run_single_media_flow(
         cache_key=cache_key,
-        cache_file_type="photo",
+        cache_file_type=media_kind,
         db_service=db,
         upload_status_text=bm.uploading_status(),
-        upload_action="upload_photo",
+        upload_action="upload_video" if media_kind == "video" else "upload_photo",
         update_status=_edit_status,
         send_chat_action=lambda action: send_chat_action_if_needed(bot, message.chat.id, action, business_id),
         send_cached=_send_cached,
         download_media=_download_media,
         send_downloaded=_send_downloaded,
-        extract_file_id=lambda sent: sent.photo[-1].file_id if getattr(sent, "photo", None) else None,
+        extract_file_id=lambda sent: (
+            sent.video.file_id if media_kind == "video" and getattr(sent, "video", None)
+            else sent.photo[-1].file_id if media_kind == "photo" and getattr(sent, "photo", None)
+            else None
+        ),
         cleanup_path=remove_file,
         delete_status_message=lambda: safe_delete_message(status_message),
         on_missing_media=lambda: handle_download_error(message, business_id=business_id),
-        on_after_send=_after_send,
+        on_after_send=lambda: maybe_delete_user_message(message, user_settings["delete_message"]),
         inspect_metrics=_inspect_metrics,
+        on_rate_limit=_handle_backpressure,
+        on_queue_busy=_handle_backpressure,
     )
     return sent_message is not None
+
+
+async def process_pinterest_single_video(
+    message: types.Message,
+    post: PinterestPost,
+    source_url: str,
+    bot_url: str,
+    user_settings: dict,
+    business_id: Optional[int],
+):
+    return await process_pinterest_single_media(
+        message, post, source_url, bot_url, user_settings, business_id, "video"
+    )
+
+
+async def process_pinterest_single_photo(
+    message: types.Message,
+    post: PinterestPost,
+    source_url: str,
+    bot_url: str,
+    user_settings: dict,
+    business_id: Optional[int],
+):
+    return await process_pinterest_single_media(
+        message, post, source_url, bot_url, user_settings, business_id, "photo"
+    )
 
 
 async def process_pinterest_media_group(
@@ -371,8 +343,24 @@ async def process_pinterest_media_group(
             request_id=request_id,
         )
 
-    media_items, downloaded_paths = await resolve_cached_media_items(
-        post.media_list,
+    async def _send_entries(media_items: list[dict]) -> None:
+        caption = bm.captions(user_settings["captions"], post.description, bot_url)
+        keyboard = kb.return_video_info_keyboard(
+            None, None, None, None, None, source_url, user_settings,
+            audio_callback_data=None,
+        )
+        await send_cached_media_entries(
+            message,
+            media_items,
+            db_service=db,
+            caption=caption,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+            kind_key="type",
+        )
+
+    return await run_media_group_flow(
+        media_list=post.media_list,
         db_service=db,
         kind_getter=lambda item: item.type,
         build_cache_key=lambda index, _item, media_kind: build_media_cache_key(
@@ -383,34 +371,14 @@ async def process_pinterest_media_group(
         download_item=_download_item,
         metrics_label="pinterest_group",
         error_label="Pinterest",
+        update_status=lambda text: safe_edit_text(status_message, text),
+        upload_status_text=bm.uploading_status(),
+        send_entries=_send_entries,
+        on_empty=lambda: handle_download_error(message, business_id=business_id),
+        delete_status_message=lambda: safe_delete_message(status_message),
+        cleanup_path=remove_file,
+        on_after_send=lambda: maybe_delete_user_message(message, user_settings["delete_message"]),
     )
-
-    if not media_items:
-        await handle_download_error(message, business_id=business_id)
-        return False
-
-    try:
-        caption = bm.captions(user_settings["captions"], post.description, bot_url)
-        keyboard = kb.return_video_info_keyboard(
-            None, None, None, None, None, source_url, user_settings,
-            audio_callback_data=None,
-        )
-        await safe_edit_text(status_message, bm.uploading_status())
-        await send_cached_media_entries(
-            message,
-            media_items,
-            db_service=db,
-            caption=caption,
-            reply_markup=keyboard,
-            parse_mode="HTML",
-            kind_key="type",
-        )
-        await maybe_delete_user_message(message, user_settings["delete_message"])
-        return True
-    finally:
-        await safe_delete_message(status_message)
-        for path in downloaded_paths:
-            await remove_file(path)
 
 
 @router.inline_query(F.query.regexp(PINTEREST_URL_REGEX, mode="search"))
@@ -457,49 +425,17 @@ async def _send_inline_pinterest_video(
     )
 
 
-@router.chosen_inline_result(F.result_id.startswith("pinterest_inline:"))
-@with_chosen_inline_logging("pinterest", "chosen_inline")
-async def chosen_inline_pinterest_result(result: types.ChosenInlineResult):
-    if not result.inline_message_id:
-        logging.warning("Chosen inline Pinterest result is missing inline_message_id")
-        return
-
-    token = result.result_id.removeprefix("pinterest_inline:")
-    await _send_inline_pinterest_video(
-        token=token,
-        inline_message_id=result.inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+chosen_inline_pinterest_result, send_inline_pinterest_video_callback = (
+    register_inline_send_handlers(
+        router,
+        service="pinterest",
+        result_prefix="pinterest_inline:",
+        callback_prefix="inline:pinterest:",
+        send_fn=_send_inline_pinterest_video,
+        missing_inline_message_warning=(
+            "Chosen inline Pinterest result is missing inline_message_id"
+        ),
+        chosen_handler_name="chosen_inline_pinterest_result",
+        callback_handler_name="send_inline_pinterest_video_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:pinterest:"))
-@with_callback_logging("pinterest", "inline_callback")
-async def send_inline_pinterest_video_callback(call: types.CallbackQuery):
-    if not call.inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    token = call.data.removeprefix("inline:pinterest:")
-    await call.answer()
-    try:
-        await _send_inline_pinterest_video(
-            token=token,
-            inline_message_id=call.inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-        return
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-            return
-        if str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
-            return
+)

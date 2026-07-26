@@ -332,6 +332,11 @@ class ResilientDownloader:
                 shared_future.set_exception(exc)
             raise
         finally:
+            # If the leader task was cancelled the future was never resolved
+            # (CancelledError is not caught above); cancel it so joined
+            # duplicate requests are released instead of hanging forever.
+            if not shared_future.done():
+                shared_future.cancel()
             async with self._inflight_lock:
                 current = self._inflight_downloads.get(inflight_key)
                 if current is shared_future:
@@ -521,7 +526,7 @@ class ResilientDownloader:
 
             if self.config.allow_resume and os.path.exists(temp_path):
                 existing_size = os.path.getsize(temp_path)
-                if existing_size and supports_range:
+                if existing_size and supports_range and existing_size < total_size:
                     headers.setdefault("Range", f"bytes={existing_size}-")
                     resumed = True
                     logging.debug(
@@ -531,6 +536,20 @@ class ResilientDownloader:
                         existing_size,
                         total_size,
                     )
+                elif existing_size:
+                    # A .part at or beyond the reported total (or with an
+                    # unknown total) is likely a preallocated multipart
+                    # leftover full of zero-filled holes; resuming from its
+                    # EOF would deliver corrupt data, so restart clean.
+                    logging.debug(
+                        "Discarding stale partial download: url=%s path=%s size=%s total=%s",
+                        url,
+                        temp_path,
+                        existing_size,
+                        total_size,
+                    )
+                    os.remove(temp_path)
+                    existing_size = 0
 
             progress_state = _ProgressState(
                 total_bytes=max(0, total_size),
@@ -735,16 +754,31 @@ class ResilientDownloader:
     ) -> None:
         """Stream the full file sequentially."""
         backoff = self.config.retry_backoff
+        resume = "Range" in headers
         for attempt in range(1, self.config.max_retries + 2):
             client = self._get_session()
+            request_headers = dict(headers)
+            if resume:
+                # Recompute the offset from the real file size on every
+                # attempt: a retry after a mid-stream failure must continue
+                # from the actual end of file, not the original offset,
+                # otherwise the append re-duplicates already-written bytes.
+                resume_from = (
+                    os.path.getsize(target_path)
+                    if os.path.exists(target_path)
+                    else 0
+                )
+                request_headers["Range"] = f"bytes={resume_from}-"
+                if progress_state:
+                    progress_state.downloaded_bytes = resume_from
             try:
                 with client.stream(
                     "GET",
                     url,
-                    headers=dict(headers),
+                    headers=request_headers,
                 ) as response:
                     response.raise_for_status()
-                    if "Range" in headers:
+                    if resume:
                         if (
                             response.status_code != 206
                             or "content-range" not in response.headers
@@ -756,9 +790,7 @@ class ResilientDownloader:
                         content_length = response.headers.get("content-length") or "0"
                         if content_length.isdigit():
                             base = (
-                                progress_state.downloaded_bytes
-                                if "Range" in headers
-                                else 0
+                                progress_state.downloaded_bytes if resume else 0
                             )
                             progress_state.total_bytes = base + int(content_length)
                     if (
@@ -770,7 +802,7 @@ class ResilientDownloader:
                             progress_state.total_bytes, max_size_bytes
                         )
                     with open(
-                        target_path, "ab" if "Range" in headers else "wb"
+                        target_path, "ab" if resume else "wb"
                     ) as outfile:
                         for chunk in response.iter_bytes(
                             chunk_size=self.config.chunk_size

@@ -7,8 +7,12 @@ from typing import Any, Awaitable, Callable, Optional
 
 from services.logger import logger as logging
 from services.media.artist_names import normalize_artist_names
+from services.platforms.ytdlp_helpers import (
+    mp3_extract_postprocessors,
+    resolve_downloaded_path,
+    run_ytdlp_download,
+)
 from utils.download_manager import (
-    DownloadError,
     DownloadConfig,
     DownloadMetrics,
     DownloadQueueBusyError,
@@ -238,19 +242,9 @@ class YouTubeMediaService:
         )
 
     def _run_ytdlp_download(self, url: str, ydl_opts: dict[str, Any]) -> None:
-        with self._youtube_dl_factory(ydl_opts) as ydl:
-            ydl.download([url])
+        run_ytdlp_download(self._youtube_dl_factory, url, ydl_opts)
 
-    @staticmethod
-    def _resolve_downloaded_path(expected_path: str) -> str:
-        if os.path.exists(expected_path):
-            return expected_path
-        stem, ext = os.path.splitext(expected_path)
-        matches = sorted(glob.glob(f"{stem}*{ext}") + glob.glob(f"{stem}.*"))
-        for match in matches:
-            if os.path.isfile(match):
-                return match
-        raise DownloadError(f"yt-dlp output file missing: {expected_path}")
+    _resolve_downloaded_path = staticmethod(resolve_downloaded_path)
 
     def get_youtube_video(self, url: str) -> Optional[dict[str, Any]]:
         try:
@@ -417,11 +411,7 @@ class YouTubeMediaService:
         ydl_opts = build_ytdlp_youtube_options(
             format="bestaudio[ext=m4a]/bestaudio/best",
             outtmpl=out_template,
-            postprocessors=[{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
+            postprocessors=mp3_extract_postprocessors(),
             merge_output_format="mp3",
         )
         if max_filesize is not None:
