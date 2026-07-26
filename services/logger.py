@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar, Token
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -20,6 +20,12 @@ EVENT_LOG = os.path.join(LOG_DIR, "events_log.jsonl")
 PERF_LOG = os.path.join(LOG_DIR, "perf_log.jsonl")
 
 os.makedirs(LOG_DIR, exist_ok=True)
+
+_DISABLE_SINKS_ENV = "LOG_DISABLE_SINKS"
+
+
+def _sinks_disabled() -> bool:
+    return os.getenv(_DISABLE_SINKS_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 _log_context: ContextVar[dict[str, Any]] = ContextVar("maxload_log_context", default={})
 
@@ -426,11 +432,14 @@ def _safe_add_handler(
         return False
 
 
-_base_logger.addHandler(_build_console_handler(logging.INFO))
-_safe_add_handler(lambda: _build_file_handler(INFO_LOG, logging.INFO), description="info file logger", path=INFO_LOG)
-_safe_add_handler(lambda: _build_file_handler(ERROR_LOG, logging.ERROR), description="error file logger", path=ERROR_LOG)
-_safe_add_handler(lambda: _build_json_handler(EVENT_LOG, "event"), description="event json logger", path=EVENT_LOG)
-_safe_add_handler(lambda: _build_json_handler(PERF_LOG, "perf"), description="perf json logger", path=PERF_LOG)
+if _sinks_disabled():
+    _base_logger.addHandler(logging.NullHandler())
+else:
+    _base_logger.addHandler(_build_console_handler(logging.INFO))
+    _safe_add_handler(lambda: _build_file_handler(INFO_LOG, logging.INFO), description="info file logger", path=INFO_LOG)
+    _safe_add_handler(lambda: _build_file_handler(ERROR_LOG, logging.ERROR), description="error file logger", path=ERROR_LOG)
+    _safe_add_handler(lambda: _build_json_handler(EVENT_LOG, "event"), description="event json logger", path=EVENT_LOG)
+    _safe_add_handler(lambda: _build_json_handler(PERF_LOG, "perf"), description="perf json logger", path=PERF_LOG)
 
 logger = ContextLoggerAdapter(_base_logger, {})
 
@@ -449,20 +458,45 @@ def get_log_context() -> dict[str, Any]:
     return dict(_log_context.get())
 
 
-def _configure_third_party_loggers() -> None:
-    noisy_loggers = {
-        "aiogram": logging.ERROR,
-        "aiogram.event": logging.CRITICAL,
-        "aiosqlite": logging.ERROR,
-        "httpcore": logging.WARNING,
-        "httpx": logging.WARNING,
-        "asyncio": logging.WARNING,
-    }
+_THIRD_PARTY_LOG_LEVELS = {
+    "aiogram": logging.ERROR,
+    "aiogram.event": logging.CRITICAL,
+    "aiosqlite": logging.ERROR,
+    "httpcore": logging.WARNING,
+    "httpx": logging.WARNING,
+    "asyncio": logging.WARNING,
+}
 
-    for name, level in noisy_loggers.items():
+
+def _configure_third_party_loggers() -> None:
+    for name, level in _THIRD_PARTY_LOG_LEVELS.items():
         third_party_logger = logging.getLogger(name)
         third_party_logger.setLevel(level)
         third_party_logger.propagate = False
+        # With propagate=False and no handlers of their own, surviving records
+        # (e.g. aiogram ERROR) would fall through to logging.lastResort — raw,
+        # unformatted stderr that never reaches the log files — so route them
+        # through the app's handlers explicitly.
+        for handler in _base_logger.handlers:
+            if handler not in third_party_logger.handlers:
+                third_party_logger.addHandler(handler)
+
+
+def disable_log_sinks() -> None:
+    """Detach and close every log sink for this process.
+
+    Used by short-lived worker subprocesses (services.download.worker_cli) so
+    they neither pollute stderr — which the parent process reads as the error
+    protocol — nor write/rotate the parent's log files from a second process.
+    """
+    os.environ[_DISABLE_SINKS_ENV] = "1"
+    targets = [_base_logger] + [logging.getLogger(name) for name in _THIRD_PARTY_LOG_LEVELS]
+    for target in targets:
+        for handler in list(target.handlers):
+            target.removeHandler(handler)
+            with suppress(Exception):
+                handler.close()
+    _base_logger.addHandler(logging.NullHandler())
 
 
 _configure_third_party_loggers()

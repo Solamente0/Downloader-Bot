@@ -212,6 +212,7 @@ async def test_send_to_all_message_uses_bounded_runner(monkeypatch):
             return_value=[
                 SimpleNamespace(user_id=1, status="active"),
                 SimpleNamespace(user_id=2, status="inactive"),
+                SimpleNamespace(user_id=3, status="ban"),
             ]
         )
     )
@@ -236,9 +237,57 @@ async def test_send_to_all_message_uses_bounded_runner(monkeypatch):
     await admin.send_to_all_message(message, state)
 
     run_bounded.assert_awaited_once()
-    _, kwargs = run_bounded.await_args
+    args, kwargs = run_bounded.await_args
     assert kwargs["limit"] == admin._ADMIN_MAILING_CONCURRENCY
+    assert [user.user_id for user in args[0]] == [1, 2]
     assert fake_bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_deliver_mailing_message_handles_typed_telegram_errors(monkeypatch):
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+    fake_db = SimpleNamespace(
+        delete_user=AsyncMock(),
+        set_inactive=AsyncMock(),
+        set_active=AsyncMock(),
+    )
+
+    monkeypatch.setattr(admin, "db", fake_db)
+    monkeypatch.setattr(admin, "_ADMIN_THROTTLE_SECONDS", 0.0)
+
+    def make_bot(error):
+        async def copy_message(**_kwargs):
+            raise error
+
+        return SimpleNamespace(copy_message=copy_message)
+
+    monkeypatch.setattr(
+        admin,
+        "bot",
+        make_bot(TelegramForbiddenError(method=None, message="Forbidden: bots can't send messages to bots")),
+    )
+    await admin._deliver_mailing_message(SimpleNamespace(user_id=1, status="active"), sender_id=9, message_id=5)
+    fake_db.delete_user.assert_awaited_once_with(1)
+    fake_db.set_inactive.assert_not_awaited()
+
+    monkeypatch.setattr(
+        admin,
+        "bot",
+        make_bot(TelegramForbiddenError(method=None, message="Forbidden: bot was blocked by the user")),
+    )
+    await admin._deliver_mailing_message(SimpleNamespace(user_id=2, status="active"), sender_id=9, message_id=5)
+    fake_db.set_inactive.assert_awaited_once_with(2)
+
+    monkeypatch.setattr(
+        admin,
+        "bot",
+        make_bot(TelegramBadRequest(method=None, message="Bad Request: chat not found")),
+    )
+    await admin._deliver_mailing_message(SimpleNamespace(user_id=3, status="active"), sender_id=9, message_id=5)
+    assert fake_db.set_inactive.await_count == 2
+    fake_db.set_inactive.assert_awaited_with(3)
+    fake_db.delete_user.assert_awaited_once()
 
 
 @pytest.mark.asyncio

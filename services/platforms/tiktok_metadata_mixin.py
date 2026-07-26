@@ -39,7 +39,18 @@ class TikTokMetadataMixin:
         video_id = get_video_id_from_url(video_url)
         with self._youtube_dl_factory(self._build_ytdlp_options()) as ydl:
             extractor = TikTokIE(ydl)
-            detail, status = extractor._extract_web_data_and_status(video_url, video_id, fatal=False)
+            try:
+                # Private yt-dlp extractor internals; a yt-dlp bump can change
+                # or remove this method, so degrade to "post unavailable"
+                # instead of crashing the fallback path.
+                detail, status = extractor._extract_web_data_and_status(video_url, video_id, fatal=False)
+            except (AttributeError, TypeError) as exc:
+                logging.error(
+                    "TikTok yt-dlp extractor internals incompatible: url=%s error=%s",
+                    video_url,
+                    exc,
+                )
+                return {}, 1
         if not isinstance(detail, dict):
             detail = {}
         return detail, status

@@ -14,7 +14,7 @@ import keyboards as kb
 import messages as bm
 from config import OUTPUT_DIR, CHANNEL_ID, MAX_FILE_SIZE
 from handlers.deps import build_handler_dependencies
-from services.media.orchestration import handle_download_backpressure, run_media_collection_flow
+from services.media.orchestration import make_message_backpressure_handler, run_media_collection_flow
 from services.media.delivery import send_cached_media_entries
 from handlers.twitter_inline import handle_twitter_inline_query, send_inline_twitter_media
 from handlers.request_dedupe import claim_message_request
@@ -36,6 +36,7 @@ from handlers.utils import (
     maybe_delete_user_message,
     react_to_message,
     remove_file,
+    register_inline_send_handlers,
     retry_async_operation,
     safe_delete_message,
     safe_edit_text,
@@ -44,8 +45,6 @@ from handlers.utils import (
     safe_answer_inline_query,
     send_chat_action_if_needed,
     should_skip_duplicate_business_message,
-    with_callback_logging,
-    with_chosen_inline_logging,
     with_inline_query_logging,
     with_inline_send_logging,
     with_message_logging,
@@ -271,6 +270,7 @@ async def _collect_media_entries(
     user_id: Optional[int] = None,
     chat_id: Optional[int] = None,
     request_id: Optional[str] = None,
+    download_dir_name: Optional[str] = None,
 ):
     return await _collect_media_entries_impl(
         tweet_id,
@@ -282,6 +282,7 @@ async def _collect_media_entries(
         user_id=user_id,
         chat_id=chat_id,
         request_id=request_id,
+        download_dir_name=download_dir_name,
     )
 
 
@@ -292,6 +293,7 @@ async def _collect_media_files(
     user_id: Optional[int] = None,
     chat_id: Optional[int] = None,
     request_id: Optional[str] = None,
+    download_dir_name: Optional[str] = None,
 ):
     return await _collect_media_files_impl(
         tweet_id,
@@ -303,6 +305,7 @@ async def _collect_media_files(
         user_id=user_id,
         chat_id=chat_id,
         request_id=request_id,
+        download_dir_name=download_dir_name,
     )
 
 
@@ -337,7 +340,8 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
         tweet_id,
     )
 
-    tweet_dir = os.path.join(OUTPUT_DIR, str(tweet_id))
+    tweet_dir_name = f"{tweet_id}_{message.chat.id}_{message.message_id}"
+    tweet_dir = os.path.join(OUTPUT_DIR, tweet_dir_name)
     os.makedirs(tweet_dir, exist_ok=True)
     logging.debug("Tweet temp directory ready: path=%s", tweet_dir)
 
@@ -347,6 +351,7 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
     comments = tweet_media['replies']
     retweets = tweet_media['retweets']
     status_message: Optional[types.Message] = None
+    delivered = False
     try:
         if business_id is None:
             status_message = await message.answer(bm.downloading_video_status())
@@ -365,6 +370,7 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
                 user_id=message.from_user.id,
                 chat_id=message.chat.id,
                 request_id=f"twitter:{message.chat.id}:{message.message_id}:{tweet_id}",
+                download_dir_name=tweet_dir_name,
             )
             logging.info(
                 "Tweet media fetched: tweet_id=%s photos=%s videos=%s",
@@ -374,26 +380,35 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
             )
             return media_entries
 
-        async def _handle_backpressure(exc: Exception) -> None:
-            await handle_download_backpressure(
-                exc,
-                business_id=business_id,
-                on_rate_limit_reply=lambda retry_after: message.reply(build_rate_limit_text(retry_after)),
-                on_queue_busy_reply=lambda position: message.reply(build_queue_busy_text(position)),
-                on_business_error=lambda: handle_download_error(message, business_id=business_id),
+        _handle_backpressure = make_message_backpressure_handler(
+            message,
+            business_id,
+            build_rate_limit_text=build_rate_limit_text,
+            build_queue_busy_text=build_queue_busy_text,
+            handle_download_error=handle_download_error,
+        )
+
+        async def _send_entries(media_entries) -> None:
+            nonlocal delivered
+            await _send_tweet_media_entries(
+                message,
+                media_entries,
+                caption_media,
+                keyboard,
             )
+            delivered = True
+
+        async def _send_empty() -> None:
+            nonlocal delivered
+            await message.answer(caption_text, reply_markup=keyboard, parse_mode="HTML")
+            delivered = True
 
         await run_media_collection_flow(
             update_status=_edit_status,
             upload_status_text=bm.uploading_status(),
             fetch_entries=_fetch_entries,
-            send_entries=lambda media_entries: _send_tweet_media_entries(
-                message,
-                media_entries,
-                caption_media,
-                keyboard,
-            ),
-            send_empty=lambda: message.answer(caption_text, reply_markup=keyboard, parse_mode="HTML"),
+            send_entries=_send_entries,
+            send_empty=_send_empty,
             delete_status_message=lambda: safe_delete_message(status_message),
             cleanup=lambda: _cleanup_tweet_dir(tweet_dir),
             on_rate_limit=_handle_backpressure,
@@ -401,11 +416,13 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
             on_too_large=lambda _exc: message.reply(bm.video_too_large()),
         )
 
-        logging.info(
-            "Tweet media delivered: user_id=%s tweet_id=%s",
-            message.from_user.id,
-            tweet_id,
-        )
+        if delivered:
+            logging.info(
+                "Tweet media delivered: user_id=%s tweet_id=%s",
+                message.from_user.id,
+                tweet_id,
+            )
+        return delivered
     except Exception as e:
         logging.exception(
             "Error processing tweet media: tweet_id=%s user_id=%s error=%s",
@@ -415,6 +432,7 @@ async def reply_media(message, tweet_id, tweet_media, bot_url, business_id, user
         )
         await react_to_message(message, "👎", business_id=business_id)
         await message.reply(bm.something_went_wrong())
+        return False
 async def _prefetch_tweet_payloads(tweet_ids: list[str]) -> list[tuple[str, dict[str, Any] | BaseException]]:
     semaphore = asyncio.Semaphore(3)
     results: list[tuple[int, str, dict[str, Any] | BaseException]] = []
@@ -481,10 +499,11 @@ async def handle_tweet_links(message, direct_url: Optional[str] = None):
                 try:
                     if isinstance(media, BaseException):
                         raise media
-                    await reply_media(message, tweet_id, media, bot_url, business_id, user_settings)
-                    if request_lease is not None:
-                        request_lease.mark_success()
-                    await maybe_delete_user_message(message, user_settings.get("delete_message"))
+                    delivered = await reply_media(message, tweet_id, media, bot_url, business_id, user_settings)
+                    if delivered:
+                        if request_lease is not None:
+                            request_lease.mark_success()
+                        await maybe_delete_user_message(message, user_settings.get("delete_message"))
                 except Exception as e:
                     logging.exception("Failed to process tweet: tweet_id=%s error=%s", tweet_id, e)
                     await message.reply(bm.something_went_wrong())
@@ -552,49 +571,17 @@ async def _send_inline_twitter_media(
     )
 
 
-@router.chosen_inline_result(F.result_id.startswith("twitter_inline:"))
-@with_chosen_inline_logging("twitter", "chosen_inline")
-async def chosen_inline_twitter_result(result: types.ChosenInlineResult):
-    if not result.inline_message_id:
-        logging.warning("Chosen inline Twitter result is missing inline_message_id")
-        return
-
-    token = result.result_id.removeprefix("twitter_inline:")
-    await _send_inline_twitter_media(
-        token=token,
-        inline_message_id=result.inline_message_id,
-        actor_name=result.from_user.full_name,
-        actor_user_id=getattr(result.from_user, "id", None),
-        request_event_id=result.result_id,
-        duplicate_handler="chosen",
+chosen_inline_twitter_result, send_inline_twitter_media_callback = (
+    register_inline_send_handlers(
+        router,
+        service="twitter",
+        result_prefix="twitter_inline:",
+        callback_prefix="inline:twitter:",
+        send_fn=_send_inline_twitter_media,
+        missing_inline_message_warning=(
+            "Chosen inline Twitter result is missing inline_message_id"
+        ),
+        chosen_handler_name="chosen_inline_twitter_result",
+        callback_handler_name="send_inline_twitter_media_callback",
     )
-
-
-@router.callback_query(F.data.startswith("inline:twitter:"))
-@with_callback_logging("twitter", "inline_callback")
-async def send_inline_twitter_media_callback(call: types.CallbackQuery):
-    if not call.inline_message_id:
-        await call.answer("This button works only in inline mode.", show_alert=True)
-        return
-
-    token = call.data.removeprefix("inline:twitter:")
-    await call.answer()
-    try:
-        await _send_inline_twitter_media(
-            token=token,
-            inline_message_id=call.inline_message_id,
-            actor_name=call.from_user.full_name,
-            actor_user_id=call.from_user.id,
-            request_event_id=str(call.id),
-            duplicate_handler="callback",
-        )
-    except PermissionError:
-        await call.answer(bm.something_went_wrong(), show_alert=True)
-        return
-    except ValueError as exc:
-        if str(exc) == "already_processing":
-            await call.answer(bm.inline_video_already_processing(), show_alert=False)
-            return
-        if str(exc) == "already_completed":
-            await call.answer(bm.inline_video_already_sent(), show_alert=False)
-            return
+)

@@ -81,6 +81,7 @@ def test_main_downloads_payload_and_writes_json(monkeypatch):
     monkeypatch.setattr(download_worker_cli.sys, "stdout", stdout)
     monkeypatch.setattr(download_worker_cli.sys, "stderr", stderr)
     monkeypatch.setattr(download_worker_cli, "ResilientDownloader", FakeDownloader)
+    monkeypatch.setattr(download_worker_cli, "disable_log_sinks", lambda: None)
 
     assert download_worker_cli.main() == 0
     assert stderr.getvalue() == ""
@@ -124,7 +125,24 @@ def test_main_writes_error_to_stderr(monkeypatch):
     monkeypatch.setattr(download_worker_cli.sys, "stdout", stdout)
     monkeypatch.setattr(download_worker_cli.sys, "stderr", stderr)
     monkeypatch.setattr(download_worker_cli, "ResilientDownloader", BrokenDownloader)
+    monkeypatch.setattr(download_worker_cli, "disable_log_sinks", lambda: None)
 
     assert download_worker_cli.main() == 1
     assert stdout.getvalue() == ""
     assert "boom" in stderr.getvalue()
+
+
+def test_main_disables_log_sinks_before_running(monkeypatch):
+    calls: list[bool] = []
+    monkeypatch.setattr(download_worker_cli, "disable_log_sinks", lambda: calls.append(True))
+    monkeypatch.setattr(
+        download_worker_cli.sys,
+        "stdin",
+        SimpleNamespace(buffer=io.BytesIO(b"")),
+    )
+    stderr = io.StringIO()
+    monkeypatch.setattr(download_worker_cli.sys, "stderr", stderr)
+
+    assert download_worker_cli.main() == 1
+    assert calls == [True]
+    assert "No payload provided" in stderr.getvalue()

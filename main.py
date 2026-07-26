@@ -352,10 +352,11 @@ async def main():
 
             dp.include_router(handlers.router)
 
-            for middleware in middlewares.__all__:
-                dp.message.outer_middleware(middleware())
-                dp.callback_query.outer_middleware(middleware())
-                dp.inline_query.outer_middleware(middleware())
+            for middleware_cls in middlewares.__all__:
+                middleware = middleware_cls()
+                dp.message.outer_middleware(middleware)
+                dp.callback_query.outer_middleware(middleware)
+                dp.inline_query.outer_middleware(middleware)
 
             await bot.set_my_commands(commands=BOT_COMMANDS)
             await bot.delete_webhook(drop_pending_updates=True)

@@ -27,10 +27,6 @@ def start_mailing():
     return "Starting mailing..."
 
 
-def mailing_message():
-    return "Enter the message to send:"
-
-
 def mailing_audience_preview(total_users, active_users, inactive_users, banned_users, private_users, group_users):
     return ("""<b>Mailing audience preview</b>
 Users to process: <b>{total_users}</b>
@@ -50,31 +46,6 @@ Enter the message to send:""").format(
     )
 
 
-def search_user_by():
-    return "Search user by:"
-
-
-def type_user(search):
-    return f"Type user {search}:"
-
-
-def user_not_found():
-    return "User not found!"
-
-
-def return_user_info(user_name, user_id, user_username, status):
-    return ("""<b>USER INFO</b>
-<b>Name</b>: {user_name}
-<b>ID</b>: {user_id}
-<b>Username</b>: {user_username}
-<b>Status</b>: {status}""").format(
-        user_name=user_name,
-        user_id=user_id,
-        user_username=user_username,
-        status=status,
-    )
-
-
 def canceled():
     return "Action canceled!"
 
@@ -85,26 +56,6 @@ def your_message_sent():
 
 def something_went_wrong():
     return "Something went wrong, see log for more information!"
-
-
-def enter_ban_reason():
-    return "Enter ban reason:"
-
-
-def successful_ban(banned_user_id):
-    return f"User {banned_user_id} successfully banned!"
-
-
-def successful_unban(unbanned_user_id):
-    return f"User {unbanned_user_id} successfully unbanned!"
-
-
-def ban_message(reason):
-    return f"You have been banned, contact @mak5er for more information!\nReason: {reason}"
-
-
-def unban_message():
-    return "You have been unbanned!"
 
 
 def please_type_message():

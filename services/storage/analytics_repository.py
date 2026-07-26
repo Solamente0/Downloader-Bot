@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 
@@ -9,7 +9,7 @@ from services.storage.models import AnalyticsEvent, NON_DOWNLOAD_ACTIONS, StatsS
 class AnalyticsRepositoryMixin:
     @staticmethod
     def _stats_period_start(period: str) -> datetime:
-        start_date = datetime.now()
+        start_date = datetime.now(timezone.utc)
         if period == "Week":
             start_date -= timedelta(weeks=1)
         elif period == "Month":

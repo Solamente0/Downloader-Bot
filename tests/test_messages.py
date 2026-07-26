@@ -96,14 +96,9 @@ def test_user_message_formatters_include_dynamic_values():
         (admin_bm.not_groups, "group"),
         (admin_bm.finish_mailing, "complete"),
         (admin_bm.start_mailing, "Starting"),
-        (admin_bm.mailing_message, "Enter the message"),
-        (admin_bm.search_user_by, "Search user"),
-        (admin_bm.user_not_found, "not found"),
         (admin_bm.canceled, "canceled"),
         (admin_bm.your_message_sent, "sent"),
         (admin_bm.something_went_wrong, "Something went wrong"),
-        (admin_bm.enter_ban_reason, "ban reason"),
-        (admin_bm.unban_message, "unbanned"),
         (admin_bm.please_type_message, "Please type message"),
         (admin_bm.log_deleted, "Log deleted"),
         (admin_bm.active_users_check_no_targets, "no users"),
@@ -125,15 +120,6 @@ def test_admin_message_formatters_include_dynamic_values():
     assert "10" in panel
     assert "7" in panel
     assert "3" in panel
-    assert admin_bm.type_user("username") == "Type user username:"
-    info = admin_bm.return_user_info("Alice", 42, "@alice", "active")
-    assert "Alice" in info
-    assert "42" in info
-    assert "@alice" in info
-    assert "active" in info
-    assert "99" in admin_bm.successful_ban(99)
-    assert "11" in admin_bm.successful_unban(11)
-    assert "spam" in admin_bm.ban_message("spam")
     assert "55" in admin_bm.active_users_check_started(55)
     completed = admin_bm.active_users_check_completed(12, 10, 2)
     assert "12" in completed

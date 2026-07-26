@@ -1,13 +1,14 @@
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
-from aiogram import types
+from aiogram import F, Router, types
 from aiogram.client.default import Default
 from aiogram.methods.base import TelegramMethod
 from aiogram.exceptions import TelegramAPIError
 
 import keyboards as kb
 import messages as bm
+from handlers.logging_utils import with_callback_logging, with_chosen_inline_logging
 from services.logger import logger as logging, summarize_text_for_log
 
 _INLINE_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
@@ -315,3 +316,92 @@ def build_inline_album_result(
         ),
         reply_markup=reply_markup,
     )
+
+
+async def run_inline_send_callback(
+    call: types.CallbackQuery,
+    prefix: str,
+    sender_fn: Callable[..., Awaitable[None]],
+) -> None:
+    if not call.inline_message_id:
+        await call.answer("This button works only in inline mode.", show_alert=True)
+        return
+
+    token = call.data.removeprefix(prefix)
+    await call.answer()
+    try:
+        await sender_fn(
+            token=token,
+            inline_message_id=call.inline_message_id,
+            actor_name=call.from_user.full_name,
+            actor_user_id=call.from_user.id,
+            request_event_id=str(call.id),
+            duplicate_handler="callback",
+        )
+    except PermissionError:
+        await call.answer(bm.something_went_wrong(), show_alert=True)
+    except ValueError as exc:
+        if str(exc) == "already_processing":
+            await call.answer(bm.inline_video_already_processing(), show_alert=False)
+        elif str(exc) == "already_completed":
+            await call.answer(bm.inline_video_already_sent(), show_alert=False)
+        else:
+            await call.answer(bm.something_went_wrong(), show_alert=True)
+
+
+def register_inline_send_handlers(
+    router: Router,
+    *,
+    service: str,
+    result_prefix: str,
+    callback_prefix: str,
+    send_fn: Callable[..., Awaitable[None]],
+    missing_inline_message_warning: str,
+    chosen_flow: str = "chosen_inline",
+    callback_flow: str = "inline_callback",
+    chosen_handler_name: Optional[str] = None,
+    callback_handler_name: Optional[str] = None,
+) -> tuple[
+    Callable[[types.ChosenInlineResult], Awaitable[None]],
+    Callable[[types.CallbackQuery], Awaitable[None]],
+]:
+    async def _chosen_inline_result_handler(result: types.ChosenInlineResult) -> None:
+        if not result.inline_message_id:
+            logging.warning(missing_inline_message_warning)
+            return
+
+        token = result.result_id.removeprefix(result_prefix)
+        await send_fn(
+            token=token,
+            inline_message_id=result.inline_message_id,
+            actor_name=result.from_user.full_name,
+            actor_user_id=getattr(result.from_user, "id", None),
+            request_event_id=result.result_id,
+            duplicate_handler="chosen",
+        )
+
+    async def _send_inline_callback_handler(call: types.CallbackQuery) -> None:
+        await run_inline_send_callback(call, callback_prefix, send_fn)
+
+    if chosen_handler_name:
+        _chosen_inline_result_handler.__name__ = chosen_handler_name
+        _chosen_inline_result_handler.__qualname__ = chosen_handler_name
+    if callback_handler_name:
+        _send_inline_callback_handler.__name__ = callback_handler_name
+        _send_inline_callback_handler.__qualname__ = callback_handler_name
+
+    chosen_handler = with_chosen_inline_logging(service, chosen_flow)(
+        _chosen_inline_result_handler
+    )
+    chosen_handler = router.chosen_inline_result(
+        F.result_id.startswith(result_prefix)
+    )(chosen_handler)
+
+    callback_handler = with_callback_logging(service, callback_flow)(
+        _send_inline_callback_handler
+    )
+    callback_handler = router.callback_query(
+        F.data.startswith(callback_prefix)
+    )(callback_handler)
+
+    return chosen_handler, callback_handler

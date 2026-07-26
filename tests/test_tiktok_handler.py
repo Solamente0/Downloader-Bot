@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from handlers import telegram_ui_utils, tiktok
+from services.media import delivery
 from services.inline.album_links import get_inline_album_request
 from services.inline.video_requests import (
+    claim_inline_video_request,
     create_inline_video_request,
     get_inline_video_request,
 )
@@ -70,6 +72,44 @@ async def test_process_tiktok_url_returns_original_on_error(monkeypatch):
     )
     result = await tiktok.process_tiktok_url_async(original_url)
     assert result == original_url
+
+
+@pytest.mark.asyncio
+async def test_process_tiktok_url_coalesces_concurrent_expansions(monkeypatch):
+    expected_url = "https://www.tiktok.com/@user/video/123456"
+    head_calls = []
+    release = asyncio.Event()
+
+    class SlowResponse:
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            await release.wait()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_head(url, allow_redirects, headers, timeout=None):
+        head_calls.append(url)
+        return SlowResponse(expected_url)
+
+    monkeypatch.setattr(
+        tiktok,
+        "get_http_session",
+        AsyncMock(return_value=DummySession(head_handler=fake_head)),
+    )
+
+    short_url = "https://vm.tiktok.com/ABC123/"
+    first = asyncio.create_task(tiktok.process_tiktok_url_async(short_url))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(tiktok.process_tiktok_url_async(short_url))
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [expected_url, expected_url]
+    assert head_calls == [short_url]
 
 
 @pytest.mark.asyncio
@@ -232,7 +272,9 @@ async def test_process_tiktok_video_reuses_inflight_download_across_business_cha
         "download_video",
         AsyncMock(side_effect=fake_download_video),
     )
-    monkeypatch.setattr(tiktok, "build_video_send_kwargs", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        delivery, "build_video_send_kwargs", AsyncMock(return_value={})
+    )
     monkeypatch.setattr(tiktok, "send_chat_action_if_needed", AsyncMock())
     monkeypatch.setattr(tiktok, "safe_delete_message", AsyncMock())
     monkeypatch.setattr(tiktok, "maybe_delete_user_message", AsyncMock())
@@ -337,6 +379,49 @@ async def test_process_tiktok_photos_replies_only_on_first_sent_message(monkeypa
     )
     assert message.reply_photo.await_count == 0
     assert tiktok.db.add_file.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_download_tiktok_doc_callback_uses_pressing_user_settings(monkeypatch):
+    settings = {
+        "captions": "on",
+        "delete_message": "off",
+        "info_buttons": "off",
+        "url_button": "off",
+        "audio_button": "off",
+        "as_document": "off",
+    }
+    call = SimpleNamespace(
+        data="doc:tiktok:123",
+        from_user=SimpleNamespace(id=42),
+        answer=AsyncMock(),
+        message=SimpleNamespace(
+            # call.message is authored by the bot, not the pressing user.
+            from_user=SimpleNamespace(id=999999, is_bot=True),
+            chat=SimpleNamespace(id=42, type="private"),
+            business_connection_id=None,
+        ),
+    )
+
+    monkeypatch.setattr(tiktok.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(tiktok.db, "user_settings", AsyncMock(return_value=settings))
+    monkeypatch.setattr(
+        tiktok,
+        "fetch_tiktok_data_with_retry",
+        AsyncMock(return_value={"error": None, "code": 0, "data": {"id": "123"}}),
+    )
+    monkeypatch.setattr(
+        tiktok, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot")
+    )
+    process_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(tiktok, "process_tiktok_video", process_mock)
+
+    await tiktok.download_tiktok_doc_callback(call)
+
+    tiktok.db.user_settings.assert_awaited_once_with(42)
+    assert process_mock.await_args.kwargs["actor_user_id"] == 42
+    override_settings = process_mock.await_args.args[3]
+    assert override_settings["as_document"] == "on"
 
 
 @pytest.mark.asyncio
@@ -781,3 +866,83 @@ async def test_chosen_inline_tiktok_result_edits_inline_photo(monkeypatch):
     request = get_inline_video_request(token)
     assert request is not None
     assert request.state == "completed"
+
+
+def _make_inline_send_call(data: str, inline_message_id):
+    return SimpleNamespace(
+        data=data,
+        inline_message_id=inline_message_id,
+        id="callback-1",
+        from_user=SimpleNamespace(id=42, full_name="Inline User"),
+        message=None,
+        answer=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_inline_tiktok_video_callback_requires_inline_message_id():
+    call = _make_inline_send_call("inline:tiktok:some-token", None)
+
+    await tiktok.send_inline_tiktok_video_callback(call)
+
+    call.answer.assert_awaited_once_with(
+        "This button works only in inline mode.", show_alert=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_inline_tiktok_video_callback_reports_already_processing():
+    settings = {
+        "captions": "on",
+        "delete_message": "off",
+        "info_buttons": "on",
+        "url_button": "on",
+        "audio_button": "on",
+    }
+    token = create_inline_video_request(
+        "tiktok",
+        "https://www.tiktok.com/@creator/video/123",
+        42,
+        settings,
+    )
+    claim_inline_video_request(token)
+
+    call = _make_inline_send_call(f"inline:tiktok:{token}", "inline-message-cb")
+
+    await tiktok.send_inline_tiktok_video_callback(call)
+
+    assert call.answer.await_count == 2
+    last_answer = call.answer.await_args_list[-1]
+    assert last_answer.args == (tiktok.bm.inline_video_already_processing(),)
+    assert last_answer.kwargs == {"show_alert": False}
+
+
+@pytest.mark.asyncio
+async def test_run_inline_send_callback_alerts_on_unknown_value_error():
+    from handlers.inline_utils import run_inline_send_callback
+
+    sender = AsyncMock(side_effect=ValueError("boom"))
+    call = _make_inline_send_call("inline:tiktok:some-token", "inline-message-cb")
+
+    await run_inline_send_callback(call, "inline:tiktok:", sender)
+
+    sender.assert_awaited_once()
+    assert sender.await_args.kwargs["token"] == "some-token"
+    assert sender.await_args.kwargs["duplicate_handler"] == "callback"
+    last_answer = call.answer.await_args_list[-1]
+    assert last_answer.args == (tiktok.bm.something_went_wrong(),)
+    assert last_answer.kwargs == {"show_alert": True}
+
+
+@pytest.mark.asyncio
+async def test_run_inline_send_callback_alerts_on_permission_error():
+    from handlers.inline_utils import run_inline_send_callback
+
+    sender = AsyncMock(side_effect=PermissionError("token_owner_mismatch"))
+    call = _make_inline_send_call("inline:tiktok:some-token", "inline-message-cb")
+
+    await run_inline_send_callback(call, "inline:tiktok:", sender)
+
+    last_answer = call.answer.await_args_list[-1]
+    assert last_answer.args == (tiktok.bm.something_went_wrong(),)
+    assert last_answer.kwargs == {"show_alert": True}

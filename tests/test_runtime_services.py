@@ -23,6 +23,54 @@ def _configure_runtime_state(monkeypatch, tmp_path, *modules):
     return state_file
 
 
+def test_state_store_flushes_synchronously_without_event_loop(monkeypatch, tmp_path):
+    state_file = tmp_path / "runtime_state.json"
+    monkeypatch.setattr(runtime_state_store, "_STATE_FILE", state_file)
+
+    runtime_state_store.save_bucket("demo_bucket", {"key": "value"})
+
+    assert state_file.exists()
+    assert '"demo_bucket"' in state_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_state_store_offloads_writes_to_background_flush_on_event_loop(monkeypatch, tmp_path):
+    state_file = tmp_path / "runtime_state.json"
+    monkeypatch.setattr(runtime_state_store, "_STATE_FILE", state_file)
+
+    runtime_state_store.save_bucket("demo_bucket", {"key": "value"})
+    runtime_state_store.save_bucket("demo_bucket", {"key": "updated"})
+
+    flush_task = runtime_state_store._flush_task
+    assert flush_task is not None
+    await flush_task
+
+    persisted = state_file.read_text(encoding="utf-8")
+    assert '"updated"' in persisted
+    assert runtime_state_store.load_bucket("demo_bucket", dict) == {"key": "updated"}
+
+
+def test_state_store_serves_reads_from_memory_cache(monkeypatch, tmp_path):
+    state_file = tmp_path / "runtime_state.json"
+    monkeypatch.setattr(runtime_state_store, "_STATE_FILE", state_file)
+
+    runtime_state_store.save_bucket("demo_bucket", {"key": "value"})
+    state_file.unlink()
+
+    assert runtime_state_store.load_bucket("demo_bucket", dict) == {"key": "value"}
+
+
+def test_state_store_cache_invalidated_when_state_file_changes(monkeypatch, tmp_path):
+    first_file = tmp_path / "first_state.json"
+    monkeypatch.setattr(runtime_state_store, "_STATE_FILE", first_file)
+    runtime_state_store.save_bucket("demo_bucket", {"key": "value"})
+
+    second_file = tmp_path / "second_state.json"
+    monkeypatch.setattr(runtime_state_store, "_STATE_FILE", second_file)
+
+    assert runtime_state_store.load_bucket("demo_bucket", dict) == {}
+
+
 def test_pending_requests_store_get_and_pop(monkeypatch):
     monkeypatch.setattr(pending_requests, "_pending", {})
     monkeypatch.setattr(pending_requests, "_loaded", True)

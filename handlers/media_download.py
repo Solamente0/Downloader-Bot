@@ -4,20 +4,26 @@ from aiogram import types
 
 import keyboards as kb
 import messages as bm
+from app_context import bot, send_analytics
 from config import (
     BATCH_LINKS_MAX_CONCURRENCY,
+    BATCH_LINKS_MAX_ITEMS,
     BATCH_LINKS_MIN_CONCURRENCY,
     BATCH_LINKS_PARALLEL_ACTIVE_JOBS_THRESHOLD,
     BATCH_LINKS_PARALLEL_QUEUE_DEPTH_THRESHOLD,
 )
+from handlers.commands import update_info
 from handlers.utils import get_bot_username, get_message_text, safe_delete_message
+from services.download.queue import get_download_queue
 from services.logger import logger as logging, summarize_url_for_log
 from services.stats.constants import SERVICE_DISPLAY_NAMES
 from services.inline.album_links import get_inline_album_request
 from services.links.detection import extract_supported_link, extract_supported_links
-import handlers.user as user_mod
 
 logging = logging.bind(service="media_download")
+
+_MAX_BATCH_LINKS = max(1, int(BATCH_LINKS_MAX_ITEMS))
+_ALBUM_SERVICES = {"instagram", "threads", "tiktok", "pinterest", "twitter"}
 
 
 async def _process_inline_album_deeplink(message: types.Message, payload: str) -> bool:
@@ -33,25 +39,8 @@ async def _process_inline_album_deeplink(message: types.Message, payload: str) -
         return True
 
     try:
-        if request.service == "instagram":
-            from handlers import instagram
-            await instagram.process_instagram(message, direct_url=request.url)
-            return True
-        if request.service == "threads":
-            from handlers import threads
-            await threads.process_threads(message, direct_url=request.url)
-            return True
-        if request.service == "tiktok":
-            from handlers import tiktok
-            await tiktok.process_tiktok(message, direct_url=request.url)
-            return True
-        if request.service == "pinterest":
-            from handlers import pinterest
-            await pinterest.process_pinterest(message, direct_url=request.url)
-            return True
-        if request.service == "twitter":
-            from handlers import twitter
-            await twitter.handle_tweet_links(message, direct_url=request.url)
+        if request.service in _ALBUM_SERVICES:
+            await _process_supported_link(message, request.service, request.url)
             return True
     except Exception:
         logging.exception(
@@ -73,7 +62,7 @@ async def _process_pending_message(message: types.Message) -> None:
     if not detected:
         return
     service, url = detected
-    await user_mod._process_supported_link(message, service, url)
+    await _process_supported_link(message, service, url)
 
 
 async def _process_supported_link(message: types.Message, service: str, url: str) -> None:
@@ -127,7 +116,7 @@ def _has_multiple_supported_links(message: types.Message) -> bool:
 def _resolve_batch_concurrency() -> int:
     min_concurrency = max(1, int(BATCH_LINKS_MIN_CONCURRENCY))
     max_concurrency = max(min_concurrency, int(BATCH_LINKS_MAX_CONCURRENCY))
-    load = user_mod.get_download_queue().load_snapshot()
+    load = get_download_queue().load_snapshot()
     if (
         load.queued_jobs > int(BATCH_LINKS_PARALLEL_QUEUE_DEPTH_THRESHOLD)
         or load.active_jobs >= int(BATCH_LINKS_PARALLEL_ACTIVE_JOBS_THRESHOLD)
@@ -141,15 +130,15 @@ async def process_batch_links(message: types.Message):
     if len(links) <= 1:
         return
 
-    selected_links = links[:user_mod._MAX_BATCH_LINKS]
-    await user_mod.send_analytics(
+    selected_links = links[:_MAX_BATCH_LINKS]
+    await send_analytics(
         user_id=message.from_user.id,
         chat_type=message.chat.type,
         action_name="batch_links",
     )
-    await user_mod.update_info(message)
+    await update_info(message)
 
-    concurrency = min(len(selected_links), user_mod._resolve_batch_concurrency())
+    concurrency = min(len(selected_links), _resolve_batch_concurrency())
     status_message = await message.answer(
         bm.batch_links_started(len(selected_links), len(links)),
         parse_mode="HTML",
@@ -157,7 +146,7 @@ async def process_batch_links(message: types.Message):
     try:
         if concurrency > 1:
             await safe_delete_message(status_message)
-            await user_mod._process_batch_links_parallel(message, selected_links, concurrency)
+            await _process_batch_links_parallel(message, selected_links, concurrency)
             status_message = await message.answer(bm.batch_links_finished(len(selected_links)))
             return
 
@@ -168,7 +157,7 @@ async def process_batch_links(message: types.Message):
                 bm.batch_link_progress(index, len(selected_links), service_name),
             )
             try:
-                await user_mod._process_supported_link(message, service, url)
+                await _process_supported_link(message, service, url)
             except Exception as exc:
                 logging.exception(
                     "Batch link failed: user_id=%s service=%s url=%s error=%s",
@@ -201,7 +190,7 @@ async def _process_batch_links_parallel(
                 bm.batch_link_progress(index, total, service_name),
             )
             try:
-                await user_mod._process_supported_link(message, service, url)
+                await _process_supported_link(message, service, url)
             except Exception as exc:
                 logging.exception(
                     "Parallel batch link failed: user_id=%s service=%s url=%s error=%s",
@@ -220,7 +209,7 @@ async def _process_batch_links_parallel(
 
 
 async def show_supported_sites(call: types.CallbackQuery):
-    bot_username = await get_bot_username(user_mod.bot)
+    bot_username = await get_bot_username(bot)
     await call.message.edit_text(
         bm.help_message(bot_username),
         reply_markup=kb.start_keyboard(bot_username, ref_user_id=call.from_user.id),

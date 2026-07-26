@@ -168,13 +168,15 @@ async def collect_media_entries(
     user_id: Optional[int] = None,
     chat_id: Optional[int] = None,
     request_id: Optional[str] = None,
+    download_dir_name: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any] | None] = []
     download_tasks = []
-    media_meta: list[tuple[int, str, str, str, str]] = []
+    media_meta: list[tuple[int, int, str, str, str, str]] = []
     media_items = extract_twitter_media_items(tweet_media)
     total_items = len(media_items)
     post_url = tweet_media.get("tweetURL") or f"https://x.com/i/status/{tweet_id}"
+    dir_name = download_dir_name or str(tweet_id)
 
     for index, media in enumerate(media_items):
         media_url = media.get("url")
@@ -197,8 +199,9 @@ async def collect_media_entries(
             )
             continue
 
-        file_name = os.path.join(str(tweet_id), os.path.basename(urlsplit(media_url).path))
+        file_name = os.path.join(dir_name, os.path.basename(urlsplit(media_url).path))
         entries.append(None)
+        slot = len(entries) - 1
         logging.debug(
             "Queueing tweet media download: tweet_id=%s type=%s url=%s",
             tweet_id,
@@ -216,13 +219,13 @@ async def collect_media_entries(
                 max_size_bytes=max_file_size,
             )
         )
-        media_meta.append((index, media_kind, file_name, media_url, cache_key))
+        media_meta.append((slot, index, media_kind, file_name, media_url, cache_key))
 
     if not download_tasks:
         return [entry for entry in entries if entry is not None]
 
     results = await asyncio.gather(*download_tasks, return_exceptions=True)
-    for (index, media_kind, file_path, media_url, cache_key), result in zip(media_meta, results):
+    for (slot, index, media_kind, file_path, media_url, cache_key), result in zip(media_meta, results):
         if isinstance(result, (DownloadRateLimitError, DownloadQueueBusyError, DownloadTooLargeError)):
             raise result
         if isinstance(result, Exception):
@@ -249,7 +252,7 @@ async def collect_media_entries(
                 resumed=isinstance(result, DownloadMetrics) and result.resumed,
             ),
         )
-        entries[index] = {
+        entries[slot] = {
             "index": index,
             "kind": media_kind,
             "cache_key": cache_key,
@@ -272,6 +275,7 @@ async def collect_media_files(
     user_id: Optional[int] = None,
     chat_id: Optional[int] = None,
     request_id: Optional[str] = None,
+    download_dir_name: Optional[str] = None,
 ) -> tuple[list[str], list[str]]:
     entries = await collect_media_entries(
         tweet_id,
@@ -283,6 +287,7 @@ async def collect_media_files(
         user_id=user_id,
         chat_id=chat_id,
         request_id=request_id,
+        download_dir_name=download_dir_name,
     )
     photos = [str(entry["path"]) for entry in entries if entry["kind"] == "photo" and entry["path"]]
     videos = [str(entry["path"]) for entry in entries if entry["kind"] == "video" and entry["path"]]

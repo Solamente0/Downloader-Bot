@@ -72,6 +72,16 @@ async def _ensure_settings_entities(
         )
 
 
+async def _resolve_settings_target(call: types.CallbackQuery) -> int | None:
+    if call.message and call.message.chat.type != "private":
+        is_admin = await user_mod._is_group_admin(call.message.chat.id, call.from_user.id)
+        if not is_admin:
+            await call.answer(bm.settings_admin_only(), show_alert=True)
+            return None
+        return call.message.chat.id
+    return call.from_user.id
+
+
 async def settings_menu(message: types.Message):
     await user_mod.send_analytics(user_id=message.from_user.id, chat_type=message.chat.type, action_name="settings")
     if message.chat.type != "private":
@@ -92,11 +102,8 @@ async def open_category(call: types.CallbackQuery):
         await call.answer()
         return
     cat = call.data.split(":", 1)[1]
-    if call.message and call.message.chat.type != "private":
-        is_admin = await user_mod._is_group_admin(call.message.chat.id, call.from_user.id)
-        if not is_admin:
-            await call.answer(bm.settings_admin_only(), show_alert=True)
-            return
+    if await _resolve_settings_target(call) is None:
+        return
     await call.message.edit_text(
         text=bm.category_settings_text(cat),
         reply_markup=kb.return_category_settings_keyboard(cat),
@@ -110,14 +117,9 @@ async def open_setting(call: types.CallbackQuery):
     if field is None:
         await call.answer(bm.invalid_settings_option(), show_alert=True)
         return
-    if call.message and call.message.chat.type != "private":
-        is_admin = await user_mod._is_group_admin(call.message.chat.id, call.from_user.id)
-        if not is_admin:
-            await call.answer(bm.settings_admin_only(), show_alert=True)
-            return
-        target_id = call.message.chat.id
-    else:
-        target_id = call.from_user.id
+    target_id = await _resolve_settings_target(call)
+    if target_id is None:
+        return
 
     try:
         await user_mod._ensure_settings_entities(call.message, call.from_user)
@@ -143,14 +145,9 @@ async def change_setting(call: types.CallbackQuery):
         await call.answer(bm.invalid_settings_option(), show_alert=True)
         return
     field, value = setting_payload
-    if call.message and call.message.chat.type != "private":
-        is_admin = await user_mod._is_group_admin(call.message.chat.id, call.from_user.id)
-        if not is_admin:
-            await call.answer(bm.settings_admin_only(), show_alert=True)
-            return
-        target_id = call.message.chat.id
-    else:
-        target_id = call.from_user.id
+    target_id = await _resolve_settings_target(call)
+    if target_id is None:
+        return
 
     try:
         await user_mod._ensure_settings_entities(call.message, call.from_user)

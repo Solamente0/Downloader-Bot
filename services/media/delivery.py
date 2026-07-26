@@ -2,13 +2,14 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 
-from services.logger import logger as logging
+from services.logger import logger as logging, summarize_url_for_log
 from services.media.artist_names import normalize_artist_names
 from services.media.video_metadata import build_video_send_kwargs
 
@@ -237,6 +238,73 @@ async def send_audio_with_thumbnail(
             Path(embedded_audio_path).unlink(missing_ok=True)
 
 
+def make_video_or_document_senders(
+    message: types.Message,
+    *,
+    caption: str | None,
+    reply_markup_fn: Callable[[], Any],
+    as_document: bool,
+    cached_log_label: str,
+    cached_log_url: str | None = None,
+    parse_mode: str = "HTML",
+) -> tuple[
+    Callable[[str], Awaitable[types.Message | None]],
+    Callable[[str], Awaitable[types.Message]],
+    Callable[[types.Message], str | None],
+]:
+    """Build the (send_cached, send_downloaded, extract_file_id) triple shared
+    by the single-video message flows: as_document switches reply_document
+    (with disable_content_type_detection) vs reply_video, and a cached send
+    that hits TelegramBadRequest resolves to None so the flow re-downloads."""
+
+    async def send_cached(file_id: str) -> types.Message | None:
+        logging.info(
+            "Serving cached %s: url=%s file_id=%s",
+            cached_log_label,
+            summarize_url_for_log(cached_log_url),
+            file_id,
+        )
+        try:
+            if as_document:
+                return await message.reply_document(
+                    document=file_id,
+                    caption=caption,
+                    reply_markup=reply_markup_fn(),
+                    parse_mode=parse_mode,
+                    disable_content_type_detection=True,
+                )
+            return await message.reply_video(
+                video=file_id,
+                caption=caption,
+                reply_markup=reply_markup_fn(),
+                parse_mode=parse_mode,
+            )
+        except TelegramBadRequest:
+            return None
+
+    async def send_downloaded(path: str) -> types.Message:
+        if as_document:
+            return await message.reply_document(
+                document=FSInputFile(path),
+                caption=caption,
+                reply_markup=reply_markup_fn(),
+                parse_mode=parse_mode,
+                disable_content_type_detection=True,
+            )
+        return await message.reply_video(
+            video=FSInputFile(path),
+            caption=caption,
+            reply_markup=reply_markup_fn(),
+            parse_mode=parse_mode,
+            **(await build_video_send_kwargs(path)),
+        )
+
+    def extract_file_id(sent_message: types.Message) -> str | None:
+        return extract_sent_file_id(sent_message, "video")
+
+    return send_cached, send_downloaded, extract_file_id
+
+
 def extract_sent_file_id(sent_message: types.Message, media_kind: str) -> str | None:
     if getattr(sent_message, "document", None):
         return sent_message.document.file_id
@@ -311,8 +379,21 @@ async def send_cached_media_entries(
         album_items = entries[:-1]
         for offset in range(0, len(album_items), 10):
             batch = album_items[offset:offset + 10]
+            video_kwargs_by_index: dict[int, dict[str, Any]] = {}
+            if not as_document:
+                video_indexes = [
+                    index
+                    for index, entry in enumerate(batch)
+                    if str(entry[kind_key]) == "video"
+                ]
+                if video_indexes:
+                    kwargs_list = await asyncio.gather(*(
+                        build_video_send_kwargs(str(batch[index].get(path_key)) if batch[index].get(path_key) else None)
+                        for index in video_indexes
+                    ))
+                    video_kwargs_by_index = dict(zip(video_indexes, kwargs_list))
             media_group = MediaGroupBuilder()
-            for entry in batch:
+            for index, entry in enumerate(batch):
                 media_kind = str(entry[kind_key])
                 media_ref = resolve_media_input(
                     entry,
@@ -325,7 +406,7 @@ async def send_cached_media_entries(
                 elif media_kind == "video":
                     media_group.add_video(
                         media=media_ref,
-                        **(await build_video_send_kwargs(str(entry.get(path_key)) if entry.get(path_key) else None)),
+                        **video_kwargs_by_index[index],
                     )
                 else:
                     media_group.add_photo(media=media_ref)
@@ -336,8 +417,8 @@ async def send_cached_media_entries(
             sent_group = await message.answer_media_group(**send_kwargs)
             has_sent_media = True
 
-            for sent_message, entry in zip(sent_group, batch):
-                await _cache_sent_entry(
+            await asyncio.gather(*(
+                _cache_sent_entry(
                     db_service,
                     entry,
                     sent_message,
@@ -345,6 +426,8 @@ async def send_cached_media_entries(
                     cache_key_key=cache_key_key,
                     cached_key=cached_key,
                 )
+                for sent_message, entry in zip(sent_group, batch)
+            ))
 
     last_entry = entries[-1]
     media_kind = str(last_entry[kind_key])

@@ -304,6 +304,159 @@ async def test_download_subprocess_times_out_and_kills_worker(monkeypatch, tmp_p
     assert process.communicate_calls == 2
 
 
+def test_download_single_retry_recomputes_range_offset(monkeypatch, tmp_path):
+    downloader = ResilientDownloader(
+        str(tmp_path), config=DownloadConfig(max_retries=1, retry_backoff=0.0)
+    )
+    part_path = tmp_path / "video.part"
+    part_path.write_bytes(b"0123")
+    full_payload = b"0123456789"
+    seen_ranges = []
+
+    class FlakyResponse:
+        def __init__(self, start, fail):
+            self.start = start
+            self.fail = fail
+            self.status_code = 206
+            self.headers = {
+                "content-range": f"bytes {start}-9/10",
+                "content-length": str(10 - start),
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self, chunk_size):
+            if self.fail:
+                yield full_payload[self.start : self.start + 3]
+                raise RuntimeError("connection dropped")
+            yield full_payload[self.start :]
+
+    class FlakySession:
+        def __init__(self):
+            self.calls = 0
+
+        def stream(self, method, url, headers=None, **kwargs):
+            self.calls += 1
+            seen_ranges.append(headers["Range"])
+            start = int(headers["Range"].removeprefix("bytes=").rstrip("-"))
+            return FlakyResponse(start, fail=self.calls == 1)
+
+    session = FlakySession()
+    monkeypatch.setattr(downloader, "_get_session", lambda: session)
+
+    downloader._download_single(
+        "https://cdn.example.com/video.mp4",
+        str(part_path),
+        {"Range": "bytes=4-"},
+    )
+
+    assert seen_ranges == ["bytes=4-", "bytes=7-"]
+    assert part_path.read_bytes() == full_payload
+
+
+@pytest.mark.asyncio
+async def test_download_leader_cancellation_releases_joiners(monkeypatch, tmp_path):
+    downloader = ResilientDownloader(str(tmp_path))
+    downloader._inflight_downloads.clear()
+    started = asyncio.Event()
+
+    async def hanging_submit(runner, **_kwargs):
+        started.set()
+        await asyncio.sleep(60)
+
+    def fake_queue():
+        return SimpleNamespace(submit=hanging_submit)
+
+    monkeypatch.setattr(download_manager, "get_download_queue", fake_queue)
+
+    leader = asyncio.create_task(
+        downloader.download("https://cdn.example.com/video.mp4", "video.mp4")
+    )
+    await started.wait()
+    joiner = asyncio.create_task(
+        downloader.download("https://cdn.example.com/video.mp4", "video.mp4")
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    leader.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(joiner, timeout=1)
+
+
+def test_download_sync_discards_full_size_partial_instead_of_resuming(
+    monkeypatch, tmp_path
+):
+    downloader = ResilientDownloader(str(tmp_path))
+    temp_path = tmp_path / f"video.mp4{downloader.config.temp_suffix}"
+    temp_path.write_bytes(b"\x00" * 10)
+    seen_headers = []
+
+    monkeypatch.setattr(downloader, "_probe", lambda url, headers: (10, True))
+
+    def fake_download_single(
+        url, target_path, headers, *, progress_state=None, max_size_bytes=None
+    ):
+        seen_headers.append(dict(headers))
+        Path(target_path).write_bytes(b"0123456789")
+
+    monkeypatch.setattr(downloader, "_download_single", fake_download_single)
+
+    metrics = downloader._download_sync(
+        "https://cdn.example.com/video.mp4",
+        "video.mp4",
+        {},
+        False,
+        None,
+        None,
+    )
+
+    assert metrics.resumed is False
+    assert "Range" not in seen_headers[0]
+    assert not temp_path.exists()
+    assert (tmp_path / "video.mp4").read_bytes() == b"0123456789"
+
+
+def test_download_sync_resumes_partial_smaller_than_total(monkeypatch, tmp_path):
+    downloader = ResilientDownloader(str(tmp_path))
+    temp_path = tmp_path / f"video.mp4{downloader.config.temp_suffix}"
+    temp_path.write_bytes(b"0123")
+    seen_headers = []
+
+    monkeypatch.setattr(downloader, "_probe", lambda url, headers: (10, True))
+
+    def fake_download_single(
+        url, target_path, headers, *, progress_state=None, max_size_bytes=None
+    ):
+        seen_headers.append(dict(headers))
+        with open(target_path, "ab") as outfile:
+            outfile.write(b"456789")
+
+    monkeypatch.setattr(downloader, "_download_single", fake_download_single)
+
+    metrics = downloader._download_sync(
+        "https://cdn.example.com/video.mp4",
+        "video.mp4",
+        {},
+        False,
+        None,
+        None,
+    )
+
+    assert metrics.resumed is True
+    assert seen_headers[0]["Range"] == "bytes=4-"
+    assert (tmp_path / "video.mp4").read_bytes() == b"0123456789"
+
+
 def test_close_download_http_clients_closes_registered_clients(tmp_path):
     download_manager.close_download_http_clients()
     downloader = ResilientDownloader(str(tmp_path))

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import handlers
-from handlers import user
+from handlers import media_download, user
 from services.stats import chart
 
 
@@ -268,6 +268,39 @@ async def test_change_setting_rejects_invalid_callback_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_change_setting_group_non_admin_is_denied(monkeypatch):
+    call = DummyCallback("setting:captions:on")
+    call.message.chat = SimpleNamespace(id=-100500, type="supergroup")
+    fake_db = SimpleNamespace(set_user_setting=AsyncMock(), get_user_setting=AsyncMock())
+    monkeypatch.setattr(user, "db", fake_db)
+    monkeypatch.setattr(user, "_is_group_admin", AsyncMock(return_value=False))
+
+    await user.change_setting(call)
+
+    call.answer.assert_awaited_once_with(user.bm.settings_admin_only(), show_alert=True)
+    fake_db.set_user_setting.assert_not_awaited()
+    call.message.edit_reply_markup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_change_setting_group_admin_targets_chat(monkeypatch):
+    call = DummyCallback("setting:captions:on")
+    call.message.chat = SimpleNamespace(id=-100500, type="supergroup")
+    fake_db = SimpleNamespace(
+        upsert_chat=AsyncMock(),
+        set_user_setting=AsyncMock(),
+        get_user_setting=AsyncMock(return_value="on"),
+    )
+    monkeypatch.setattr(user, "db", fake_db)
+    monkeypatch.setattr(user, "_is_group_admin", AsyncMock(return_value=True))
+
+    await user.change_setting(call)
+
+    fake_db.set_user_setting.assert_awaited_once_with(user_id=-100500, field="captions", value="on")
+    call.message.edit_reply_markup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_change_setting_handles_invalid_db_setting_value(monkeypatch):
     call = DummyCallback("setting:captions:on")
     fake_db = SimpleNamespace(
@@ -423,11 +456,11 @@ async def test_process_batch_links_dispatches_each_supported_link(monkeypatch):
     message.answer = AsyncMock(side_effect=status_messages)
     process_supported_link = AsyncMock()
 
-    monkeypatch.setattr(user, "_process_supported_link", process_supported_link)
-    monkeypatch.setattr(user, "_resolve_batch_concurrency", lambda: 1)
-    monkeypatch.setattr(user, "send_analytics", AsyncMock())
-    monkeypatch.setattr(user, "update_info", AsyncMock())
-    monkeypatch.setattr(user.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(media_download, "_process_supported_link", process_supported_link)
+    monkeypatch.setattr(media_download, "_resolve_batch_concurrency", lambda: 1)
+    monkeypatch.setattr(media_download, "send_analytics", AsyncMock())
+    monkeypatch.setattr(media_download, "update_info", AsyncMock())
+    monkeypatch.setattr(media_download.asyncio, "sleep", AsyncMock())
 
     await user.process_batch_links(message)
 
@@ -451,11 +484,11 @@ async def test_process_batch_links_can_run_parallel_when_load_is_low(monkeypatch
     message.answer = AsyncMock(side_effect=status_messages)
     process_supported_link = AsyncMock()
 
-    monkeypatch.setattr(user, "_process_supported_link", process_supported_link)
-    monkeypatch.setattr(user, "_resolve_batch_concurrency", lambda: 2)
-    monkeypatch.setattr(user, "send_analytics", AsyncMock())
-    monkeypatch.setattr(user, "update_info", AsyncMock())
-    monkeypatch.setattr(user.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(media_download, "_process_supported_link", process_supported_link)
+    monkeypatch.setattr(media_download, "_resolve_batch_concurrency", lambda: 2)
+    monkeypatch.setattr(media_download, "send_analytics", AsyncMock())
+    monkeypatch.setattr(media_download, "update_info", AsyncMock())
+    monkeypatch.setattr(media_download.asyncio, "sleep", AsyncMock())
 
     await user.process_batch_links(message)
 

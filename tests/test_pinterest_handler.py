@@ -450,3 +450,196 @@ async def test_chosen_inline_pinterest_result_edits_inline_photo(monkeypatch):
 
     media = pinterest.safe_edit_inline_media.await_args.args[2]
     assert media.media == "cached-photo-id"
+
+
+def _inline_send_settings():
+    return {
+        "captions": "on",
+        "delete_message": "off",
+        "info_buttons": "on",
+        "url_button": "on",
+        "audio_button": "on",
+    }
+
+
+def _make_chosen_result(token, inline_message_id):
+    return SimpleNamespace(
+        result_id=f"pinterest_inline:{token}",
+        inline_message_id=inline_message_id,
+        from_user=SimpleNamespace(full_name="Inline User"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_pinterest_result_uploads_photo_when_not_cached(monkeypatch):
+    token = create_inline_video_request(
+        "pinterest",
+        "https://www.pinterest.com/pin/555000111/",
+        42,
+        _inline_send_settings(),
+    )
+    result = _make_chosen_result(token, "inline-pin-photo-upload")
+    post = pinterest.PinterestPost(
+        id="pin-photo-upload",
+        description="fresh photo pin",
+        media_list=[pinterest.PinterestMedia(url="https://cdn.example.com/photo.jpg", type="photo")],
+    )
+
+    sent_photo = SimpleNamespace(photo=[SimpleNamespace(file_id="fresh-photo-id")])
+    monkeypatch.setattr(pinterest, "CHANNEL_ID", -1001234567890)
+    monkeypatch.setattr(pinterest, "bot", SimpleNamespace(send_photo=AsyncMock(return_value=sent_photo)))
+    monkeypatch.setattr(pinterest.pinterest_service, "fetch_post", AsyncMock(return_value=post))
+    monkeypatch.setattr(pinterest.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pinterest.db, "add_file", AsyncMock())
+    monkeypatch.setattr(pinterest, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_media", AsyncMock(return_value=True))
+
+    await pinterest.chosen_inline_pinterest_result(result)
+
+    pinterest.bot.send_photo.assert_awaited_once()
+    assert pinterest.bot.send_photo.await_args.kwargs["chat_id"] == -1001234567890
+    pinterest.db.add_file.assert_awaited_once_with(
+        "https://www.pinterest.com/pin/555000111/#photo", "fresh-photo-id", "photo"
+    )
+    media = pinterest.safe_edit_inline_media.await_args.args[2]
+    assert media.media == "fresh-photo-id"
+    request = get_inline_video_request(token)
+    assert request is not None
+    assert request.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_pinterest_result_downloads_and_uploads_video(monkeypatch, tmp_path):
+    token = create_inline_video_request(
+        "pinterest",
+        "https://www.pinterest.com/pin/555000222/",
+        42,
+        _inline_send_settings(),
+    )
+    result = _make_chosen_result(token, "inline-pin-video-upload")
+    post = pinterest.PinterestPost(
+        id="pin-video-upload",
+        description="fresh video pin",
+        media_list=[pinterest.PinterestMedia(url="https://cdn.example.com/video.mp4", type="video")],
+    )
+
+    download_file = tmp_path / "pin-inline.mp4"
+    download_file.write_bytes(b"video-bytes")
+    metrics = DownloadMetrics(
+        url="https://cdn.example.com/video.mp4",
+        path=str(download_file),
+        size=download_file.stat().st_size,
+        elapsed=0.01,
+        used_multipart=False,
+        resumed=False,
+    )
+
+    sent_video = SimpleNamespace(video=SimpleNamespace(file_id="fresh-video-id"))
+    monkeypatch.setattr(pinterest, "CHANNEL_ID", -1001234567890)
+    monkeypatch.setattr(pinterest, "bot", SimpleNamespace(send_video=AsyncMock(return_value=sent_video)))
+    monkeypatch.setattr(pinterest.pinterest_service, "fetch_post", AsyncMock(return_value=post))
+    monkeypatch.setattr(pinterest.pinterest_service, "download_media", AsyncMock(return_value=metrics))
+    monkeypatch.setattr(pinterest.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pinterest.db, "add_file", AsyncMock())
+    monkeypatch.setattr(pinterest, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_media", AsyncMock(return_value=True))
+
+    await pinterest.chosen_inline_pinterest_result(result)
+
+    pinterest.bot.send_video.assert_awaited_once()
+    pinterest.db.add_file.assert_awaited_once_with(
+        "https://www.pinterest.com/pin/555000222/", "fresh-video-id", "video"
+    )
+    media = pinterest.safe_edit_inline_media.await_args.args[2]
+    assert media.media == "fresh-video-id"
+    request = get_inline_video_request(token)
+    assert request is not None
+    assert request.state == "completed"
+    assert not download_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_pinterest_result_completes_when_video_too_large(monkeypatch, tmp_path):
+    token = create_inline_video_request(
+        "pinterest",
+        "https://www.pinterest.com/pin/555000333/",
+        42,
+        _inline_send_settings(),
+    )
+    result = _make_chosen_result(token, "inline-pin-video-too-large")
+    post = pinterest.PinterestPost(
+        id="pin-video-too-large",
+        description="huge video pin",
+        media_list=[pinterest.PinterestMedia(url="https://cdn.example.com/video.mp4", type="video")],
+    )
+
+    download_file = tmp_path / "pin-too-large.mp4"
+    download_file.write_bytes(b"video-bytes")
+    metrics = DownloadMetrics(
+        url="https://cdn.example.com/video.mp4",
+        path=str(download_file),
+        size=download_file.stat().st_size,
+        elapsed=0.01,
+        used_multipart=False,
+        resumed=False,
+    )
+
+    monkeypatch.setattr(pinterest, "CHANNEL_ID", -1001234567890)
+    monkeypatch.setattr(pinterest, "MAX_FILE_SIZE", metrics.size)
+    monkeypatch.setattr(pinterest, "bot", SimpleNamespace(send_video=AsyncMock()))
+    monkeypatch.setattr(pinterest.pinterest_service, "fetch_post", AsyncMock(return_value=post))
+    monkeypatch.setattr(pinterest.pinterest_service, "download_media", AsyncMock(return_value=metrics))
+    monkeypatch.setattr(pinterest.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pinterest.db, "add_file", AsyncMock())
+    monkeypatch.setattr(pinterest, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_media", AsyncMock(return_value=True))
+
+    await pinterest.chosen_inline_pinterest_result(result)
+
+    pinterest.bot.send_video.assert_not_awaited()
+    last_edit = pinterest.safe_edit_inline_text.await_args_list[-1]
+    assert last_edit.args[2] == pinterest.bm.video_too_large()
+    request = get_inline_video_request(token)
+    assert request is not None
+    assert request.state == "completed"
+    assert not download_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_pinterest_result_resets_when_download_fails(monkeypatch):
+    token = create_inline_video_request(
+        "pinterest",
+        "https://www.pinterest.com/pin/555000444/",
+        42,
+        _inline_send_settings(),
+    )
+    result = _make_chosen_result(token, "inline-pin-video-failed")
+    post = pinterest.PinterestPost(
+        id="pin-video-failed",
+        description="broken video pin",
+        media_list=[pinterest.PinterestMedia(url="https://cdn.example.com/video.mp4", type="video")],
+    )
+
+    monkeypatch.setattr(pinterest, "CHANNEL_ID", -1001234567890)
+    monkeypatch.setattr(pinterest, "bot", SimpleNamespace(send_video=AsyncMock()))
+    monkeypatch.setattr(pinterest.pinterest_service, "fetch_post", AsyncMock(return_value=post))
+    monkeypatch.setattr(pinterest.pinterest_service, "download_media", AsyncMock(return_value=None))
+    monkeypatch.setattr(pinterest.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(pinterest.db, "add_file", AsyncMock())
+    monkeypatch.setattr(pinterest, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(pinterest, "safe_edit_inline_media", AsyncMock(return_value=True))
+
+    await pinterest.chosen_inline_pinterest_result(result)
+
+    pinterest.bot.send_video.assert_not_awaited()
+    pinterest.db.add_file.assert_not_awaited()
+    last_edit = pinterest.safe_edit_inline_text.await_args_list[-1]
+    assert last_edit.args[2] == pinterest.bm.something_went_wrong()
+    assert last_edit.kwargs["reply_markup"] is not None
+    request = get_inline_video_request(token)
+    assert request is not None
+    assert request.state == "pending"

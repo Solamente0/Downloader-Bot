@@ -1,11 +1,11 @@
 import os
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from aiohttp.client_exceptions import ClientResponseError
 
-from handlers import twitter
+from handlers import twitter, twitter_inline
 from services.inline.album_links import get_inline_album_request
 from utils.download_manager import DownloadMetrics
 
@@ -138,7 +138,7 @@ async def test_reply_media_uses_cached_file_id_for_single_video(monkeypatch):
     monkeypatch.setattr(twitter, "safe_edit_text", AsyncMock(return_value=True))
     monkeypatch.setattr(twitter, "maybe_delete_user_message", AsyncMock())
 
-    await twitter.reply_media(
+    delivered = await twitter.reply_media(
         message,
         "123",
         tweet_media,
@@ -147,12 +147,117 @@ async def test_reply_media_uses_cached_file_id_for_single_video(monkeypatch):
         {"delete_message": "off", "info_buttons": "off", "url_button": "off", "audio_button": "off"},
     )
 
+    assert delivered is True
     assert twitter.twitter_downloader.download.await_count == 0
     assert message.reply_video.await_args.kwargs["video"] == "cached-file-id"
 
 
 @pytest.mark.asyncio
-async def test_collect_media_entries_only_downloads_cache_misses(monkeypatch, tmp_path):
+async def test_reply_media_returns_false_when_flow_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(twitter, "OUTPUT_DIR", str(tmp_path))
+    status_message = SimpleNamespace(delete=AsyncMock())
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=99, type="private"),
+        message_id=7,
+        answer=AsyncMock(return_value=status_message),
+        reply=AsyncMock(),
+    )
+    tweet_media = {
+        "tweetURL": "https://x.com/user/status/123",
+        "text": "caption",
+        "likes": 1,
+        "replies": 2,
+        "retweets": 3,
+    }
+
+    monkeypatch.setattr(twitter, "send_analytics", AsyncMock())
+    monkeypatch.setattr(twitter, "_collect_media_entries", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(twitter, "safe_delete_message", AsyncMock())
+    monkeypatch.setattr(twitter, "react_to_message", AsyncMock())
+
+    delivered = await twitter.reply_media(
+        message,
+        "123",
+        tweet_media,
+        "https://t.me/maxloadbot",
+        None,
+        {"delete_message": "off", "info_buttons": "off", "url_button": "off", "audio_button": "off"},
+    )
+
+    assert delivered is False
+    message.reply.assert_awaited_with(twitter.bm.something_went_wrong())
+
+
+@pytest.mark.asyncio
+async def test_reply_media_uses_request_unique_download_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(twitter, "OUTPUT_DIR", str(tmp_path))
+    status_message = SimpleNamespace(delete=AsyncMock())
+    message = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=99, type="private"),
+        message_id=7,
+        answer=AsyncMock(return_value=status_message),
+        reply=AsyncMock(),
+    )
+    tweet_media = {
+        "tweetURL": "https://x.com/user/status/123",
+        "text": "caption",
+        "likes": 1,
+        "replies": 2,
+        "retweets": 3,
+    }
+
+    monkeypatch.setattr(twitter, "send_analytics", AsyncMock())
+    collect_entries = AsyncMock(return_value=[])
+    monkeypatch.setattr(twitter, "_collect_media_entries", collect_entries)
+    monkeypatch.setattr(twitter, "safe_delete_message", AsyncMock())
+
+    delivered = await twitter.reply_media(
+        message,
+        "123",
+        tweet_media,
+        "https://t.me/maxloadbot",
+        None,
+        {"delete_message": "off", "info_buttons": "off", "url_button": "off", "audio_button": "off"},
+    )
+
+    assert delivered is True
+    assert collect_entries.await_args.kwargs["download_dir_name"] == "123_99_7"
+
+
+@pytest.mark.asyncio
+async def test_collect_media_entries_supports_custom_download_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(twitter, "OUTPUT_DIR", str(tmp_path))
+    twitter.twitter_downloader.output_dir = str(tmp_path)
+
+    async def fake_download(url, filename, **_kwargs):
+        path = tmp_path / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+        return DownloadMetrics(
+            url=url,
+            path=str(path),
+            size=path.stat().st_size,
+            elapsed=0.01,
+            used_multipart=False,
+            resumed=False,
+        )
+
+    monkeypatch.setattr(twitter.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(twitter.twitter_downloader, "download", AsyncMock(side_effect=fake_download))
+
+    entries = await twitter._collect_media_entries(
+        "42",
+        {
+            "tweetURL": "https://x.com/user/status/42",
+            "media_extended": [{"type": "video", "url": "https://cdn.example.com/2.mp4"}],
+        },
+        download_dir_name="42_99_7",
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["path"] == str(tmp_path / "42_99_7" / "2.mp4")
     monkeypatch.setattr(twitter, "OUTPUT_DIR", str(tmp_path))
     twitter.twitter_downloader.output_dir = str(tmp_path)
     get_file_id = AsyncMock(side_effect=["cached-photo-id", None])
@@ -303,6 +408,44 @@ async def test_inline_twitter_query_prefers_media_thumbnail(monkeypatch):
     results = query.answer.await_args.args[0]
     assert len(results) == 1
     assert results[0].thumbnail_url == "https://cdn.example.com/1.jpg"
+
+
+@pytest.mark.asyncio
+async def test_inline_twitter_query_single_media_skips_album_request(monkeypatch):
+    settings = {
+        "captions": "on",
+        "delete_message": "off",
+        "info_buttons": "on",
+        "url_button": "on",
+        "audio_button": "on",
+    }
+    query = SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
+        chat_type="inline",
+        query="https://x.com/user/status/321",
+        answer=AsyncMock(),
+    )
+    tweet_media = {
+        "tweetURL": "https://x.com/user/status/321",
+        "text": "single video tweet",
+        "media_extended": [
+            {"type": "video", "url": "https://cdn.example.com/1.mp4", "thumbnail_url": "https://cdn.example.com/1.jpg"},
+        ],
+    }
+
+    monkeypatch.setattr(twitter, "send_analytics", AsyncMock())
+    monkeypatch.setattr(twitter.db, "user_settings", AsyncMock(return_value=settings))
+    monkeypatch.setattr(twitter, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(twitter, "_get_tweet_context", AsyncMock(return_value=("321", tweet_media)))
+    create_album_request = Mock(return_value="unused-token")
+    monkeypatch.setattr(twitter_inline, "create_inline_album_request", create_album_request)
+
+    await twitter.inline_twitter_query(query)
+
+    results = query.answer.await_args.args[0]
+    assert len(results) == 1
+    assert results[0].id.startswith("twitter_inline:")
+    create_album_request.assert_not_called()
 
 
 @pytest.mark.asyncio

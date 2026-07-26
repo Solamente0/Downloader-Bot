@@ -6,6 +6,11 @@ from typing import Any, Callable, Optional
 from services.logger import logger as logging
 from services.download.queue import QueueBackpressureError, QueueRateLimitError, get_download_queue
 from services.platforms.tiktok_common import _safe_int, get_video_id_from_url
+from services.platforms.ytdlp_helpers import (
+    mp3_extract_postprocessors,
+    resolve_downloaded_path,
+    run_ytdlp_download,
+)
 from utils.download_manager import (
     DownloadError,
     DownloadMetrics,
@@ -134,8 +139,7 @@ class TikTokDownloadMixin:
         return _hook
 
     def _run_ytdlp_download(self, url: str, ydl_opts: dict[str, Any]) -> None:
-        with self._youtube_dl_factory(ydl_opts) as ydl:
-            ydl.download([url])
+        run_ytdlp_download(self._youtube_dl_factory, url, ydl_opts)
 
     @staticmethod
     def _cleanup_paths(*paths: str) -> None:
@@ -154,37 +158,22 @@ class TikTokDownloadMixin:
                 except OSError:
                     logging.debug("Failed to clean up TikTok yt-dlp artifact: path=%s", normalized)
 
-    @staticmethod
-    def _resolve_downloaded_path(expected_path: str) -> str:
-        if os.path.exists(expected_path):
-            return expected_path
-        stem, ext = os.path.splitext(expected_path)
-        matches = sorted(glob.glob(f"{stem}*{ext}") + glob.glob(f"{stem}.*"))
-        for match in matches:
-            if os.path.isfile(match):
-                return match
-        raise DownloadError(f"yt-dlp output file missing: {expected_path}")
+    _resolve_downloaded_path = staticmethod(resolve_downloaded_path)
 
-    def _download_video_with_ytdlp_sync(
+    def _download_media_with_ytdlp_sync(
         self,
         *,
         source_url: str,
         output_path: str,
+        outtmpl: str,
+        ydl_overrides: dict[str, Any],
         progress_callback=None,
     ) -> DownloadMetrics:
         started_at = self._monotonic()
         ydl_opts = {
             **self._build_ytdlp_download_options(),
-            "format": (
-                "best[ext=mp4][acodec!=none][vcodec!=none]/"
-                "best[acodec!=none][vcodec!=none]/"
-                "best*[ext=mp4][acodec!=none][vcodec!=none]/"
-                "best*[acodec!=none][vcodec!=none]/"
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-                "bestvideo+bestaudio/best"
-            ),
-            "outtmpl": output_path,
-            "merge_output_format": "mp4",
+            **ydl_overrides,
+            "outtmpl": outtmpl,
             "progress_hooks": [self._build_progress_hook(progress_callback, started_at)],
         }
         try:
@@ -212,6 +201,31 @@ class TikTokDownloadMixin:
             self._cleanup_paths(output_path, f"{os.path.splitext(output_path)[0]}.*")
             raise DownloadError(str(exc)) from exc
 
+    def _download_video_with_ytdlp_sync(
+        self,
+        *,
+        source_url: str,
+        output_path: str,
+        progress_callback=None,
+    ) -> DownloadMetrics:
+        return self._download_media_with_ytdlp_sync(
+            source_url=source_url,
+            output_path=output_path,
+            outtmpl=output_path,
+            ydl_overrides={
+                "format": (
+                    "best[ext=mp4][acodec!=none][vcodec!=none]/"
+                    "best[acodec!=none][vcodec!=none]/"
+                    "best*[ext=mp4][acodec!=none][vcodec!=none]/"
+                    "best*[acodec!=none][vcodec!=none]/"
+                    "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+                    "bestvideo+bestaudio/best"
+                ),
+                "merge_output_format": "mp4",
+            },
+            progress_callback=progress_callback,
+        )
+
     def _download_audio_with_ytdlp_sync(
         self,
         *,
@@ -219,45 +233,18 @@ class TikTokDownloadMixin:
         output_path: str,
         progress_callback=None,
     ) -> DownloadMetrics:
-        started_at = self._monotonic()
         base_path, _ = os.path.splitext(output_path)
-        out_template = f"{base_path}.%(ext)s"
-        ydl_opts = {
-            **self._build_ytdlp_download_options(),
-            "format": "bestaudio/best",
-            "outtmpl": out_template,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-            "merge_output_format": "mp3",
-            "progress_hooks": [self._build_progress_hook(progress_callback, started_at)],
-        }
-        try:
-            self._run_ytdlp_download(source_url, ydl_opts)
-            resolved_path = self._resolve_downloaded_path(output_path)
-            size = os.path.getsize(resolved_path)
-            self._notify_progress(
-                progress_callback,
-                downloaded_bytes=size,
-                total_bytes=size,
-                started_at=started_at,
-                speed_bps=0.0,
-                eta_seconds=0.0,
-                done=True,
-            )
-            return DownloadMetrics(
-                url=source_url,
-                path=resolved_path,
-                size=size,
-                elapsed=self._monotonic() - started_at,
-                used_multipart=False,
-                resumed=False,
-            )
-        except Exception as exc:
-            self._cleanup_paths(output_path, f"{base_path}.*")
-            raise DownloadError(str(exc)) from exc
+        return self._download_media_with_ytdlp_sync(
+            source_url=source_url,
+            output_path=output_path,
+            outtmpl=f"{base_path}.%(ext)s",
+            ydl_overrides={
+                "format": "bestaudio/best",
+                "postprocessors": mp3_extract_postprocessors(),
+                "merge_output_format": "mp3",
+            },
+            progress_callback=progress_callback,
+        )
 
     def _build_direct_download_headers(self, source_url: str, source_data: dict[str, Any], key: str) -> dict[str, str]:
         headers = {

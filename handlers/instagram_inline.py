@@ -3,42 +3,35 @@ import re
 from typing import Optional
 
 from aiogram import types
-from aiogram.types import FSInputFile
 
 import keyboards as kb
 import messages as bm
 from handlers.deps import HandlerDependencies
 from handlers.utils import (
     build_inline_album_result,
-    build_inline_status_editor,
-    build_queue_busy_text,
-    build_rate_limit_text,
     build_start_deeplink_url,
     get_bot_url,
-    make_status_text_progress_updater,
-    remove_file,
     safe_answer_inline_query,
     safe_edit_inline_media,
     safe_edit_inline_text,
 )
 from services.logger import logger as logging, summarize_text_for_log, summarize_url_for_log
 from services.inline.album_links import create_inline_album_request
+from services.inline.send_flow import (
+    deliver_inline_photo,
+    deliver_inline_video,
+    ensure_album_preview_file_id,
+    run_inline_send_flow,
+)
 from services.inline.service_icons import get_inline_service_icon
 from services.inline.video_requests import (
-    claim_inline_video_request_for_send,
     complete_inline_video_request,
     create_inline_video_request,
     reset_inline_video_request,
 )
-from services.media.video_metadata import build_video_send_kwargs
 from services.platforms.instagram_media import (
     get_instagram_preview_url as _get_instagram_preview_url,
     strip_instagram_url,
-)
-from utils.download_manager import (
-    DownloadQueueBusyError,
-    DownloadRateLimitError,
-    log_download_metrics,
 )
 from utils.media_cache import build_media_cache_key
 
@@ -146,25 +139,16 @@ async def handle_instagram_inline_query(
 
         if len(data.media_list) > 1:
             preview_file_id = None
-            if first_item and first_item.type == "photo" and channel_id:
-                cache_key = build_media_cache_key(original_url, item_index=0, item_kind="photo")
-                preview_file_id = await deps.db.get_file_id(cache_key)
-                if not preview_file_id:
-                    try:
-                        sent = await deps.bot.send_photo(
-                            chat_id=channel_id,
-                            photo=first_item.url,
-                            caption="Instagram Album Preview",
-                        )
-                        if sent.photo:
-                            preview_file_id = sent.photo[-1].file_id
-                            await deps.db.add_file(cache_key, preview_file_id, "photo")
-                    except Exception as exc:
-                        logging.warning(
-                            "Failed to cache Instagram album preview photo: url=%s error=%s",
-                            summarize_url_for_log(original_url),
-                            exc,
-                        )
+            if first_item and first_item.type == "photo":
+                preview_file_id = await ensure_album_preview_file_id(
+                    deps=deps,
+                    channel_id=channel_id,
+                    photo_url=first_item.url,
+                    cache_key=build_media_cache_key(original_url, item_index=0, item_kind="photo"),
+                    service_name="Instagram",
+                    source_url=original_url,
+                    log=logging,
+                )
             token = create_inline_album_request(query.from_user.id, "instagram", original_url)
             deep_link = build_start_deeplink_url(bot_url, f"album_{token}")
             results = [
@@ -206,69 +190,37 @@ async def send_inline_instagram_media(
     safe_edit_inline_media_fn=safe_edit_inline_media,
     safe_edit_inline_text_fn=safe_edit_inline_text,
 ) -> None:
-    request = claim_inline_video_request_for_send(
-        token,
-        duplicate_handler=duplicate_handler,
-        actor_user_id=actor_user_id,
-    )
-    if request is None:
-        return
-
-    download_path: Optional[str] = None
-
-    _edit_inline_status = build_inline_status_editor(
-        bot=deps.bot,
-        inline_message_id=inline_message_id,
-        callback_data_factory=lambda _media_kind: f"inline:instagram:{token}",
-        safe_edit_inline_text_fn=safe_edit_inline_text_fn,
-    )
-
-    try:
+    async def _plan(request, edit_status, state) -> None:
         data = await inst_service.fetch_data(request.source_url)
         if not data or not data.media_list:
             reset_inline_video_request(token)
-            await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
+            await edit_status(bm.something_went_wrong(), with_retry_button=True)
             return
 
         if len(data.media_list) != 1:
             complete_inline_video_request(token)
-            await _edit_inline_status(bm.inline_photos_not_supported("Instagram"))
+            await edit_status(bm.inline_photos_not_supported("Instagram"))
             return
+
+        async def _build_caption():
+            return bm.captions(
+                request.user_settings["captions"],
+                data.description,
+                await get_bot_url_fn(deps.bot),
+            )
 
         media = data.media_list[0]
         if media.type == "photo":
-            cache_key = build_media_cache_key(request.source_url, item_index=0, item_kind="photo")
-            db_id = await deps.db.get_file_id(cache_key)
-            if not db_id:
-                if not channel_id:
-                    reset_inline_video_request(token)
-                    await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True, media_kind="photo")
-                    return
-
-                await _edit_inline_status(bm.uploading_status(), media_kind="photo")
-                sent = await deps.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=media.url,
-                    caption=f"Instagram Photo from {actor_name}",
-                )
-                if not sent.photo:
-                    reset_inline_video_request(token)
-                    await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True, media_kind="photo")
-                    return
-                db_id = sent.photo[-1].file_id
-                await deps.db.add_file(cache_key, db_id, "photo")
-            else:
-                await _edit_inline_status(bm.uploading_status(), media_kind="photo")
-
-            bot_url = await get_bot_url_fn(deps.bot)
-            edited = await safe_edit_inline_media_fn(
-                deps.bot,
-                inline_message_id,
-                types.InputMediaPhoto(
-                    media=db_id,
-                    caption=bm.captions(request.user_settings["captions"], data.description, bot_url),
-                    parse_mode="HTML",
-                ),
+            await deliver_inline_photo(
+                deps=deps,
+                token=token,
+                inline_message_id=inline_message_id,
+                channel_id=channel_id,
+                service_name="Instagram",
+                cache_key=build_media_cache_key(request.source_url, item_index=0, item_kind="photo"),
+                photo_url=media.url,
+                channel_caption=f"Instagram Photo from {actor_name}",
+                build_caption=_build_caption,
                 reply_markup=kb.return_video_info_keyboard(
                     None,
                     None,
@@ -279,76 +231,43 @@ async def send_inline_instagram_media(
                     request.user_settings,
                     audio_callback_data=None,
                 ),
+                edit_status=edit_status,
+                safe_edit_inline_media_fn=safe_edit_inline_media_fn,
+                log=logging,
             )
-            if edited:
-                complete_inline_video_request(token)
-                return
-
-            reset_inline_video_request(token)
-            await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True, media_kind="photo")
             return
 
         if media.type != "video":
             complete_inline_video_request(token)
-            await _edit_inline_status(bm.inline_photos_not_supported("Instagram"))
+            await edit_status(bm.inline_photos_not_supported("Instagram"))
             return
 
         db_video_url = request.source_url
         audio_callback_data = f"audio:inst:{request.source_url}"
-        db_id = await deps.db.get_file_id(db_video_url)
-        if not db_id:
-            if not channel_id:
-                reset_inline_video_request(token)
-                await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
-                return
 
+        async def _download(on_progress):
             timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
             download_name = f"{data.id}_{timestamp}_instagram_video.mp4"
-
-            await _edit_inline_status(bm.downloading_video_status())
-
-            on_progress = make_status_text_progress_updater("Instagram video", _edit_inline_status)
-
-            metrics = await inst_service.download_media(
+            return await inst_service.download_media(
                 media.url,
                 download_name,
                 user_id=request.owner_user_id,
                 request_id=f"instagram_inline:{request.owner_user_id}:{request_event_id}:{data.id}",
                 on_progress=on_progress,
             )
-            if not metrics:
-                reset_inline_video_request(token)
-                await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
-                return
 
-            log_download_metrics("instagram_inline", metrics)
-            download_path = metrics.path
-            if metrics.size >= max_file_size:
-                complete_inline_video_request(token)
-                await _edit_inline_status(bm.video_too_large())
-                return
-
-            await _edit_inline_status(bm.uploading_status())
-            sent = await deps.bot.send_video(
-                chat_id=channel_id,
-                video=FSInputFile(download_path),
-                caption=f"Instagram Video from {actor_name}",
-                **(await build_video_send_kwargs(download_path)),
-            )
-            db_id = sent.video.file_id
-            await deps.db.add_file(db_video_url, db_id, "video")
-        else:
-            await _edit_inline_status(bm.uploading_status())
-
-        bot_url = await get_bot_url_fn(deps.bot)
-        edited = await safe_edit_inline_media_fn(
-            deps.bot,
-            inline_message_id,
-            types.InputMediaVideo(
-                media=db_id,
-                caption=bm.captions(request.user_settings["captions"], data.description, bot_url),
-                parse_mode="HTML",
-            ),
+        await deliver_inline_video(
+            deps=deps,
+            token=token,
+            inline_message_id=inline_message_id,
+            channel_id=channel_id,
+            max_file_size=max_file_size,
+            service_name="Instagram",
+            cache_key=db_video_url,
+            channel_caption=f"Instagram Video from {actor_name}",
+            download_fn=_download,
+            progress_label="Instagram video",
+            build_caption=_build_caption,
             reply_markup=kb.return_video_info_keyboard(
                 None,
                 None,
@@ -359,22 +278,22 @@ async def send_inline_instagram_media(
                 request.user_settings,
                 audio_callback_data=audio_callback_data,
             ),
+            edit_status=edit_status,
+            state=state,
+            safe_edit_inline_media_fn=safe_edit_inline_media_fn,
+            metrics_log_key="instagram_inline",
+            log=logging,
         )
-        if edited:
-            complete_inline_video_request(token)
-            return
 
-        reset_inline_video_request(token)
-        await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
-    except DownloadRateLimitError as exc:
-        reset_inline_video_request(token)
-        await _edit_inline_status(build_rate_limit_text(exc.retry_after), with_retry_button=True)
-    except DownloadQueueBusyError as exc:
-        reset_inline_video_request(token)
-        await _edit_inline_status(build_queue_busy_text(exc.position), with_retry_button=True)
-    except Exception:
-        reset_inline_video_request(token)
-        await _edit_inline_status(bm.something_went_wrong(), with_retry_button=True)
-    finally:
-        if download_path:
-            await remove_file(download_path)
+    await run_inline_send_flow(
+        token=token,
+        inline_message_id=inline_message_id,
+        actor_user_id=actor_user_id,
+        duplicate_handler=duplicate_handler,
+        deps=deps,
+        service_name="Instagram",
+        callback_data=f"inline:instagram:{token}",
+        plan_fn=_plan,
+        safe_edit_inline_text_fn=safe_edit_inline_text_fn,
+        log=logging,
+    )

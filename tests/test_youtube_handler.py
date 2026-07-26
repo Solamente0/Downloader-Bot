@@ -6,7 +6,7 @@ import pytest
 from handlers import youtube
 from services.inline.video_requests import create_inline_video_request, get_inline_video_request
 from tests.conftest import FakeYoutubeDL
-from utils.download_manager import DownloadMetrics
+from utils.download_manager import DownloadMetrics, DownloadRateLimitError
 
 
 def test_get_video_stream_prefers_progressive():
@@ -327,3 +327,88 @@ async def test_download_music_falls_back_to_ytdlp_without_direct_audio_stream(mo
     assert message.reply_audio.await_args.kwargs["duration"] == 204
     youtube.db.add_file.assert_awaited_once()
     prepared_metadata.cleanup.assert_called_once_with()
+
+
+def _make_mp3_callback(status_message):
+    return SimpleNamespace(
+        data="audio:youtube:abc123",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=7, username="tester"),
+        message=SimpleNamespace(
+            business_connection_id=None,
+            chat=SimpleNamespace(id=99, type="private"),
+            answer=AsyncMock(return_value=status_message),
+            reply_audio=AsyncMock(),
+            reply=AsyncMock(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_download_youtube_mp3_callback_removes_file_when_send_fails(monkeypatch, tmp_path):
+    audio_path = tmp_path / "audio.mp3"
+    audio_path.write_bytes(b"audio")
+    metrics = DownloadMetrics(
+        url="https://www.youtube.com/watch?v=abc123",
+        path=str(audio_path),
+        size=audio_path.stat().st_size,
+        elapsed=0.1,
+        used_multipart=False,
+        resumed=False,
+    )
+    status_message = SimpleNamespace(delete=AsyncMock())
+    call = _make_mp3_callback(status_message)
+    yt = {
+        "id": "abc123",
+        "title": "Broken Audio",
+        "webpage_url": "https://www.youtube.com/watch?v=abc123",
+        "duration": 100,
+    }
+
+    monkeypatch.setattr(youtube, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(youtube, "get_bot_avatar_thumbnail", AsyncMock(return_value=None))
+    monkeypatch.setattr(youtube, "get_youtube_video", lambda _url: yt)
+    monkeypatch.setattr(youtube.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(youtube.db, "add_file", AsyncMock())
+    monkeypatch.setattr(youtube, "download_mp3_with_ytdlp_metrics", AsyncMock(return_value=metrics))
+    prepared_metadata = SimpleNamespace(thumbnail_path=None, cleanup=Mock())
+    monkeypatch.setattr(youtube, "prepare_mp3_metadata", AsyncMock(return_value=prepared_metadata))
+    monkeypatch.setattr(youtube, "send_audio_with_thumbnail", AsyncMock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(youtube, "send_chat_action_if_needed", AsyncMock())
+    monkeypatch.setattr(youtube, "safe_edit_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(youtube, "safe_delete_message", AsyncMock())
+    monkeypatch.setattr(youtube, "remove_file", AsyncMock())
+    monkeypatch.setattr(youtube, "handle_download_error", AsyncMock())
+
+    await youtube.download_youtube_mp3_callback(call)
+
+    youtube.remove_file.assert_awaited_once_with(str(audio_path))
+    prepared_metadata.cleanup.assert_called_once_with()
+    youtube.handle_download_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_download_youtube_mp3_callback_reports_backpressure(monkeypatch):
+    status_message = SimpleNamespace(delete=AsyncMock())
+    call = _make_mp3_callback(status_message)
+    yt = {
+        "id": "abc123",
+        "title": "Rate Limited Audio",
+        "webpage_url": "https://www.youtube.com/watch?v=abc123",
+        "duration": 100,
+    }
+    rate_limit_error = DownloadRateLimitError(retry_after=30.0)
+
+    monkeypatch.setattr(youtube, "get_bot_url", AsyncMock(return_value="https://t.me/maxloadbot"))
+    monkeypatch.setattr(youtube, "get_bot_avatar_thumbnail", AsyncMock(return_value=None))
+    monkeypatch.setattr(youtube, "get_youtube_video", lambda _url: yt)
+    monkeypatch.setattr(youtube.db, "get_file_id", AsyncMock(return_value=None))
+    monkeypatch.setattr(youtube, "retry_async_operation", AsyncMock(side_effect=rate_limit_error))
+    monkeypatch.setattr(youtube, "handle_download_backpressure_error", AsyncMock())
+    monkeypatch.setattr(youtube, "safe_edit_text", AsyncMock(return_value=True))
+    monkeypatch.setattr(youtube, "safe_delete_message", AsyncMock())
+
+    await youtube.download_youtube_mp3_callback(call)
+
+    youtube.handle_download_backpressure_error.assert_awaited_once()
+    assert youtube.handle_download_backpressure_error.await_args.args[0] is rate_limit_error

@@ -67,6 +67,22 @@ def test_parse_threads_post_html_keeps_text_only_post():
     assert post.media_list == []
 
 
+def test_parse_threads_post_html_falls_back_when_blob_is_not_minified():
+    # The raw-text fast path expects minified '"code":"X"'; a blob with spaces
+    # must still be found via the parse-all fallback.
+    page = (
+        '<script type="application/json" data-sjs>'
+        '{"post": {"code": "spaced", "caption": {"text": "Spaced text"}, "user": {"username": "author"}}}'
+        "</script>"
+    )
+
+    post = parse_threads_post_html(page, "spaced")
+
+    assert post is not None
+    assert post.id == "spaced"
+    assert post.description == "Spaced text"
+
+
 @pytest.mark.asyncio
 async def test_threads_service_fetches_canonical_post_url(tmp_path):
     requested_urls: list[str] = []

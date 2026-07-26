@@ -25,6 +25,8 @@ logging = logging.bind(service="download_queue")
 
 T = TypeVar("T")
 
+_SCOPE_PRUNE_INTERVAL_SECONDS = 60.0
+
 
 class QueueRateLimitError(Exception):
     def __init__(self, retry_after: float):
@@ -153,6 +155,7 @@ class AdaptiveDownloadQueue:
         self._scale_cooldown_seconds = max(1.0, float(DOWNLOAD_QUEUE_SCALE_COOLDOWN_SECONDS))
         self._idle_scale_down_seconds = max(5.0, float(DOWNLOAD_QUEUE_IDLE_SCALE_DOWN_SECONDS))
         self._last_non_empty_queue = time.monotonic()
+        self._last_scope_prune = time.monotonic()
         self._completed_jobs = 0
         self._active_jobs = 0
 
@@ -467,6 +470,9 @@ class AdaptiveDownloadQueue:
         if self._stopping:
             return
         now = time.monotonic()
+        if now - self._last_scope_prune >= _SCOPE_PRUNE_INTERVAL_SECONDS:
+            self._last_scope_prune = now
+            self._prune_idle_scopes()
         if now - self._last_scale_action < self._scale_cooldown_seconds:
             return
 
@@ -538,6 +544,45 @@ class AdaptiveDownloadQueue:
             raise QueueRateLimitError(retry_after=retry_after)
 
         bucket.append(now)
+
+    def _prune_idle_scopes(self) -> None:
+        """Drop per-scope rate/slot/lock state that is no longer in use.
+
+        Without this, _user_recent/_user_slots/_user_submit_locks gain an
+        entry per unique (user_id, chat_id) forever. Only fully idle scopes
+        are removed: no pending jobs, no in-flight request refs, an unheld
+        submit lock and an expired rate window — which also rules out tasks
+        that were woken on the lock/semaphore but have not resumed yet.
+        This runs synchronously on the event loop, so it cannot interleave
+        with submit()'s critical sections.
+        """
+        now = time.monotonic()
+        for scope_key, bucket in list(self._user_recent.items()):
+            while bucket and now - bucket[0] > self.per_user_window_seconds:
+                bucket.popleft()
+            if not bucket:
+                del self._user_recent[scope_key]
+
+        active_request_scopes = {request_key[0] for request_key in self._request_refs}
+        for scope_key in self._user_slots.keys() | self._user_submit_locks.keys():
+            if not self._scope_is_idle(scope_key, active_request_scopes):
+                continue
+            self._user_slots.pop(scope_key, None)
+            self._user_submit_locks.pop(scope_key, None)
+
+    def _scope_is_idle(
+        self,
+        scope_key: _QueueScopeKey,
+        active_request_scopes: set[_QueueScopeKey],
+    ) -> bool:
+        if self._user_pending.get(scope_key, 0) > 0:
+            return False
+        if scope_key in active_request_scopes:
+            return False
+        if scope_key in self._user_recent:
+            return False
+        lock = self._user_submit_locks.get(scope_key)
+        return lock is None or not lock.locked()
 
     @staticmethod
     def _build_scope_key(user_id: int, chat_id: Optional[int]) -> _QueueScopeKey:
