@@ -12,7 +12,7 @@ from typing import Awaitable, Callable, Mapping, MutableMapping, Optional
 
 import httpx
 
-from config import DOWNLOAD_MAX_WORKERS_CAP
+from config import DOWNLOAD_MAX_WORKERS_CAP, DOWNLOAD_PROXY_ENABLED, DOWNLOAD_PROXY_URL
 from services.logger import logger as logging
 from services.download.queue import (
     QueueBackpressureError,
@@ -999,6 +999,7 @@ class ResilientDownloader:
                     limits=limits,
                     follow_redirects=True,
                     headers=self._default_headers or None,
+                    proxy=DOWNLOAD_PROXY_URL if DOWNLOAD_PROXY_ENABLED else None,
                 )
                 _register_http_client(self._client)
             return self._client

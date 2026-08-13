@@ -14,6 +14,7 @@ import aiohttp
 from config import SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_MARKET
 from services.logger import logger as logging
 from services.media.artist_names import normalize_artist_names
+from utils.http_client import build_download_connector
 
 logging = logging.bind(service="spotify_media")
 
@@ -189,7 +190,7 @@ async def get_spotify_track(url: str) -> dict[str, Any]:
 
     canonical_url = strip_spotify_url(url)
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=build_download_connector()) as session:
         if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
             return await _get_oembed_track(session, canonical_url, spotify_id)
 

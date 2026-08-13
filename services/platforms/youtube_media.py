@@ -11,6 +11,7 @@ from services.platforms.ytdlp_helpers import (
     mp3_extract_postprocessors,
     resolve_downloaded_path,
     run_ytdlp_download,
+    ytdlp_proxy_options,
 )
 from utils.download_manager import (
     DownloadConfig,
@@ -92,7 +93,7 @@ def _parse_cookies_from_browser(value: str) -> tuple[str, Optional[str], Optiona
 
 
 def build_ytdlp_youtube_options(**overrides: Any) -> dict[str, Any]:
-    options = {**YTDLP_SPEED_OPTS}
+    options = {**YTDLP_SPEED_OPTS, **ytdlp_proxy_options()}
 
     sleep_requests = _read_float_env("YTDLP_YOUTUBE_SLEEP_REQUESTS_SECONDS")
     if sleep_requests is not None:

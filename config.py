@@ -102,6 +102,46 @@ def _read_float_env(name: str, *, required: bool = False, aliases: tuple[str, ..
         raise RuntimeError(f"Environment variable {name} must be a float.") from exc
 
 
+def _read_bool_env(name: str, *, default: bool = False) -> bool:
+    value = _read_env(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+_PROXY_SCHEMES = ("http", "https", "socks4", "socks5", "socks5h")
+
+
+def _validate_proxy_url(value: str, name: str) -> str:
+    if not value:
+        return value
+    try:
+        parsed = urlparse(value)
+    except Exception as exc:
+        raise RuntimeError(f"Invalid URL for {name}: {exc}") from exc
+
+    if parsed.scheme not in _PROXY_SCHEMES:
+        raise RuntimeError(
+            f"Invalid scheme for {name}: {parsed.scheme}. Must be one of {', '.join(_PROXY_SCHEMES)}."
+        )
+
+    host = (parsed.hostname or "").strip("[]")
+    if not host:
+        raise RuntimeError(f"No host in {name}: {value}")
+
+    return value
+
+
+def _read_proxy_env(*, enabled_name: str, url_name: str) -> tuple[bool, str | None]:
+    enabled = _read_bool_env(enabled_name)
+    url = _read_env(url_name)
+    if enabled:
+        if not url:
+            raise RuntimeError(f"{enabled_name} is true but {url_name} is not set.")
+        url = _validate_proxy_url(url, url_name)
+    return enabled, url
+
+
 BOT_TOKEN = _read_env("BOT_TOKEN", required=True)
 DATABASE_URL = _read_env("DATABASE_URL", required=True)
 ADMIN_ID = _read_int_env("ADMIN_ID", required=True, aliases=("admin_id",))
@@ -124,6 +164,12 @@ COBALT_API_KEY = _read_env("COBALT_API_KEY")
 SPOTIFY_CLIENT_ID = _read_env("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = _read_env("SPOTIFY_CLIENT_SECRET")
 SPOTIFY_MARKET = _read_env("SPOTIFY_MARKET") or "UA"
+TELEGRAM_PROXY_ENABLED, TELEGRAM_PROXY_URL = _read_proxy_env(
+    enabled_name="TELEGRAM_PROXY_ENABLED", url_name="TELEGRAM_PROXY_URL"
+)
+DOWNLOAD_PROXY_ENABLED, DOWNLOAD_PROXY_URL = _read_proxy_env(
+    enabled_name="DOWNLOAD_PROXY_ENABLED", url_name="DOWNLOAD_PROXY_URL"
+)
 BOT_POLLING_TASKS_CONCURRENCY_LIMIT = _read_int_env("BOT_POLLING_TASKS_CONCURRENCY_LIMIT") or 256
 BOT_SESSION_CONNECTION_LIMIT = _read_int_env("BOT_SESSION_CONNECTION_LIMIT") or 400
 DB_POOL_SIZE = _read_int_env("DB_POOL_SIZE") or 5

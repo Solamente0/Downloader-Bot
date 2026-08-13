@@ -26,6 +26,7 @@ from mutagen.id3 import (
 
 from services.logger import logger as logging
 from services.media.artist_names import normalize_artist_names
+from utils.http_client import build_download_connector
 
 logging = logging.bind(service="audio_metadata")
 
@@ -77,7 +78,7 @@ async def _download_cover(url: str | None) -> tuple[bytes | None, str | None]:
 
     timeout = aiohttp.ClientTimeout(total=30)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=build_download_connector()) as session:
             async with session.get(url) as response:
                 response.raise_for_status()
                 declared_size = response.content_length

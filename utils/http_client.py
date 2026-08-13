@@ -3,6 +3,7 @@ from typing import Optional
 
 import aiohttp
 
+from config import DOWNLOAD_PROXY_ENABLED, DOWNLOAD_PROXY_URL
 from services.logger import logger as logging
 
 _session: Optional[aiohttp.ClientSession] = None
@@ -13,6 +14,19 @@ _lock_loop: Optional[asyncio.AbstractEventLoop] = None
 # Slightly higher limits to speed up bursty handler traffic while keeping sockets bounded
 _CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5, sock_read=20)
 _CONNECTOR_LIMIT = 128
+
+
+def build_download_connector(**kwargs) -> aiohttp.BaseConnector:
+    """Build a TCP connector, routed through DOWNLOAD_PROXY_URL when enabled.
+
+    Shared by every module that opens its own aiohttp session for outbound
+    (non-Telegram) fetches, so a single env toggle covers them all.
+    """
+    if DOWNLOAD_PROXY_ENABLED and DOWNLOAD_PROXY_URL:
+        from aiohttp_socks import ProxyConnector
+
+        return ProxyConnector.from_url(DOWNLOAD_PROXY_URL, **kwargs)
+    return aiohttp.TCPConnector(**kwargs)
 
 
 def _get_loop_bound_lock() -> asyncio.Lock:
@@ -57,7 +71,7 @@ async def get_http_session() -> aiohttp.ClientSession:
             return _session
 
         previous_session = _session
-        connector = aiohttp.TCPConnector(
+        connector = build_download_connector(
             limit=_CONNECTOR_LIMIT,
             limit_per_host=32,
             ttl_dns_cache=300,
