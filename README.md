@@ -92,6 +92,16 @@ API_SECRET=
 CHANNEL_ID=
 COBALT_API_URL=
 COBALT_API_KEY=
+
+# Proxy support (e.g. for deployments where Telegram or platform sites are blocked/throttled)
+# Independent toggles: enable either, both, or neither.
+# TELEGRAM_PROXY_URL routes the bot's connection to CUSTOM_API_URL through the proxy.
+# DOWNLOAD_PROXY_URL routes yt-dlp, Cobalt, and other outbound media/metadata fetches through the proxy.
+# Accepted schemes: http, https, socks4, socks5, socks5h
+TELEGRAM_PROXY_ENABLED=false
+TELEGRAM_PROXY_URL=socks5://user:password@proxy-host:1080
+DOWNLOAD_PROXY_ENABLED=false
+DOWNLOAD_PROXY_URL=socks5://user:password@proxy-host:1080
 # Optional: enables richer Spotify album/track metadata; oEmbed works without credentials.
 SPOTIFY_CLIENT_ID=
 SPOTIFY_CLIENT_SECRET=
@@ -247,6 +257,7 @@ The logging layer adds request-scoped context such as `service`, `flow`, and `re
 - The project expects a custom Telegram Bot API endpoint via `CUSTOM_API_URL`
 - PostgreSQL is required in normal operation
 - Some platform flows rely on a Cobalt-compatible backend; set `COBALT_API_URL` and `COBALT_API_KEY` as needed
+- `TELEGRAM_PROXY_ENABLED`/`TELEGRAM_PROXY_URL` and `DOWNLOAD_PROXY_ENABLED`/`DOWNLOAD_PROXY_URL` are independent — useful when Telegram itself is reachable only through a proxy (e.g. `CUSTOM_API_URL` pointing at a self-hosted `telegram-bot-api` behind a tunnel) but source platforms are not, or vice versa
 - Test coverage is centered around handlers, queue/runtime behavior, database access, migrations, and startup logic
 
 Run tests with:

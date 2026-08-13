@@ -25,6 +25,8 @@ from config import (
     CUSTOM_API_URL,
     MEASUREMENT_ID,
     OUTPUT_DIR,
+    TELEGRAM_PROXY_ENABLED,
+    TELEGRAM_PROXY_URL,
 )
 from services.download.queue import shutdown_download_queue
 from services.logger import logger as logging
@@ -70,11 +72,13 @@ def create_app(
     database_factory: Callable[[], DataBase] = DataBase,
     session_timeout: int = 600,
     session_limit: int = BOT_SESSION_CONNECTION_LIMIT,
+    proxy: str | None = TELEGRAM_PROXY_URL if TELEGRAM_PROXY_ENABLED else None,
 ) -> Application:
     session = AiohttpSession(
         limit=max(1, int(session_limit)),
         api=TelegramAPIServer.from_base(api_url),
         timeout=session_timeout,
+        proxy=proxy,
     )
     default = DefaultBotProperties(parse_mode=ParseMode.HTML)
     bot = Bot(token=bot_token, default=default, session=session)

@@ -10,6 +10,7 @@ from services.platforms.ytdlp_helpers import (
     mp3_extract_postprocessors,
     resolve_downloaded_path,
     run_ytdlp_download,
+    ytdlp_proxy_options,
 )
 from utils.download_manager import (
     DownloadError,
@@ -42,6 +43,7 @@ class TikTokDownloadMixin:
             "retries": 0,
             "fragment_retries": 0,
             "concurrent_fragment_downloads": 4,
+            **ytdlp_proxy_options(),
         }
 
     @staticmethod

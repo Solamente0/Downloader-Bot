@@ -4,7 +4,15 @@ import glob
 import os
 from typing import Any, Callable
 
+from config import DOWNLOAD_PROXY_ENABLED, DOWNLOAD_PROXY_URL
 from utils.download_manager import DownloadError
+
+
+def ytdlp_proxy_options() -> dict[str, Any]:
+    """yt-dlp 'proxy' option, populated from DOWNLOAD_PROXY_URL when enabled."""
+    if DOWNLOAD_PROXY_ENABLED and DOWNLOAD_PROXY_URL:
+        return {"proxy": DOWNLOAD_PROXY_URL}
+    return {}
 
 
 def run_ytdlp_download(
